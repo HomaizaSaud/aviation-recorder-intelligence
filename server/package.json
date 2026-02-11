@@ -1,0 +1,19 @@
+{
+  "name": "cvr-fdr-analyzer-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.925.0",
+    "@aws-sdk/s3-request-presigner": "^3.925.0",
+    "cors": "^2.8.6",
+    "docx": "^9.5.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pdfkit": "^0.17.1",
+    "pg": "^8.13.1"
+  }
+}
