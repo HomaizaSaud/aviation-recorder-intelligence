@@ -53,7 +53,7 @@ def main():
     result = model.transcribe(audio, batch_size=16)
 
     diarize_model = whisperx.DiarizationPipeline(
-        use_auth_token=args.hf_token or os.getenv("PYANNOTE_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"),
+        token=args.hf_token or os.getenv("PYANNOTE_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"),
         device=device,
     )
     diarize_segments = diarize_model(audio)

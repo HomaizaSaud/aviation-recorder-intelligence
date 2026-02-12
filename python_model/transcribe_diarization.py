@@ -53,7 +53,7 @@ class DiarizedTranscriber:
         torch.load = safe_load
 
         try:
-            self.diar_pipeline = Pipeline.from_pretrained(diar_model, use_auth_token=hf_token)
+            self.diar_pipeline = Pipeline.from_pretrained(diar_model, token=hf_token)
         except Exception:
             try:
                 self.diar_pipeline = Pipeline.from_pretrained(diar_model, token=hf_token)
