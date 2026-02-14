@@ -79,3 +79,7 @@ docs/Data_Samples/*.csv
 # Temporary files
 *.tmp
 *.bak
+
+# MinIO data
+data/
+minio.exe

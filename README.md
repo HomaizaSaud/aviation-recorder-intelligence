@@ -84,16 +84,17 @@ to configure a local instance that mirrors the production workflow:
 
    ```bash
    MINIO_ENDPOINT=http://127.0.0.1:9000
-   MINIO_ACCESS_KEY=fdradmin
-   MINIO_SECRET_KEY=supersecret123
+   MINIO_ACCESS_KEY=minioadmin
+   MINIO_SECRET_KEY=minioadmin
    MINIO_REGION=us-east-1
    MINIO_BUCKET=fdr-cvr-data
-
+   MINIO_USE_SSL=false
+   
    export MINIO_ROOT_USER=fdradmin
    export MINIO_ROOT_PASSWORD=supersecret123
    minio server $HOME/minio-data --address ":9000" --console-address ":9001"
    ```
-
+   windows command: .\minio.exe server .\data --console-address ":9001" --address ":9000"
    Optional overrides include `MINIO_USE_SSL`, `MINIO_PUBLIC_BASE_URL`, and the upload/download expiry timers.
 
 5. **Verify connectivity** – Start the API with `npm run server`. The service performs a `HeadBucket` call and will create the
