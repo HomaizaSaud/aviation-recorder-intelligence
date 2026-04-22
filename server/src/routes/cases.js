@@ -640,7 +640,12 @@ router.delete('/:caseNumber', async (req, res, next) => {
 });
 router.post('/:caseNumber/emotion-analysis', async (req, res, next) => {
   try {
-    const result = await detectEmotionForCase(req.params.caseNumber, req.body || {});
+    const caseNumber = String(req.params.caseNumber).replace(/[^\w-]/g, '');
+    if (!caseNumber) {
+      res.status(400).json({ error: 'Invalid case number.' });
+      return;
+    }
+    const result = await detectEmotionForCase(caseNumber, req.body || {});
     res.json(result);
   } catch (error) {
     next(error);

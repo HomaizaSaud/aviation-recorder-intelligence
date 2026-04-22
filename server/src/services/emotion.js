@@ -117,7 +117,7 @@ const loadOriginalAudioBuffer = async (caseNumber, attachment) => {
 };
 
 const detectEmotionForCase = async (caseNumber, options = {}) => {
-  console.log('🎤 Starting emotion detection for case:', caseNumber);
+    console.log({ message: '🎤 Starting emotion detection for case', caseNumber: String(caseNumber) });
   
   const caseData = await findCaseByNumber(caseNumber);
   if (!caseData) {
