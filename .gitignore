@@ -56,6 +56,7 @@ venv/
 env/
 .venv/
 .env/
+.myvenv/
 
 # IDE and editor files
 .vscode/
@@ -71,8 +72,6 @@ Thumbs.db
 python_model/features.joblib
 python_model/model.joblib
 python_model/scaler.joblib
-python_model/model/
-python_model/emotion_detection/
 None/speechbrain/
 docs/Data_Samples/audios/
 docs/Data_Samples/*.csv
@@ -80,3 +79,7 @@ docs/Data_Samples/*.csv
 # Temporary files
 *.tmp
 *.bak
+
+# MinIO data
+data/
+minio.exe

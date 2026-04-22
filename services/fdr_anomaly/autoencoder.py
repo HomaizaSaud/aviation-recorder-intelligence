@@ -15,6 +15,9 @@ DEFAULT_STRIDE = int(os.getenv("FDR_WINDOW_STRIDE", "5"))
 DEFAULT_EPOCHS = int(os.getenv("FDR_EPOCHS", "30"))
 DEFAULT_THRESHOLD_PERCENTILE = float(os.getenv("FDR_THRESHOLD_PERCENTILE", "97"))
 DEFAULT_BATCH_SIZE = int(os.getenv("FDR_BATCH_SIZE", "128"))
+DEFAULT_BACKEND = os.getenv("FDR_AUTOENCODER_BACKEND", "pca").strip().lower()
+MIN_TRAIN_STD = float(os.getenv("FDR_MIN_TRAIN_STD", "1e-3"))
+MAX_STANDARDIZED_ABS = float(os.getenv("FDR_MAX_STANDARDIZED_ABS", "20"))
 SEGMENT_GAP_SECONDS = 2.0
 
 TIME_COLUMNS = {"Session Time", "System Time", "GPS Date & Time"}
@@ -235,11 +238,25 @@ def _build_windows(values: np.ndarray, window_size: int, stride: int) -> Tuple[n
 
 
 def _get_backend(input_dim: int) -> AutoencoderBackend:
-    if importlib.util.find_spec("torch") is not None:
-        return TorchAutoencoder(input_dim)
+    preferred = DEFAULT_BACKEND
 
-    if importlib.util.find_spec("tensorflow") is not None:
-        return TfAutoencoder(input_dim)
+    if preferred == "torch":
+        if importlib.util.find_spec("torch") is not None:
+            return TorchAutoencoder(input_dim)
+        logger.warning("FDR_AUTOENCODER_BACKEND=torch requested but torch is unavailable; using PCA.")
+
+    if preferred in {"tf", "tensorflow"}:
+        if importlib.util.find_spec("tensorflow") is not None:
+            return TfAutoencoder(input_dim)
+        logger.warning(
+            "FDR_AUTOENCODER_BACKEND=tensorflow requested but tensorflow is unavailable; using PCA."
+        )
+
+    if preferred == "auto":
+        if importlib.util.find_spec("torch") is not None:
+            return TorchAutoencoder(input_dim)
+        if importlib.util.find_spec("tensorflow") is not None:
+            return TfAutoencoder(input_dim)
 
     n_components = max(2, min(32, input_dim // 2))
     return PcaAutoencoder(input_dim, n_components)
@@ -437,7 +454,26 @@ def detect_anomalies(
         stride = 1
 
     train_end = max(1, int(n_rows * 0.7))
+    train_std = numeric_df.iloc[:train_end].std()
+    stable_feature_names = train_std[train_std >= MIN_TRAIN_STD].index.tolist()
+    if len(stable_feature_names) >= MIN_NUMERIC_FEATURES:
+        dropped_for_low_std = sorted(set(feature_names) - set(stable_feature_names))
+        if dropped_for_low_std:
+            logger.info(
+                "FDR autoencoder dropped low-variance training features: %s",
+                dropped_for_low_std,
+            )
+        numeric_df = numeric_df[stable_feature_names]
+        feature_names = stable_feature_names
+
+    if len(feature_names) < MIN_NUMERIC_FEATURES:
+        raise ValueError(
+            f"Insufficient stable numeric features after preprocessing: found {len(feature_names)}, "
+            f"need at least {MIN_NUMERIC_FEATURES}."
+        )
+
     standardized, mean, std = _standardize(numeric_df, train_end)
+    standardized = standardized.clip(lower=-MAX_STANDARDIZED_ABS, upper=MAX_STANDARDIZED_ABS)
     values = standardized.to_numpy(dtype=float)
 
     windows, starts = _build_windows(values, window_size, stride)
