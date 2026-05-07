@@ -1,0 +1,26 @@
+FROM node:20-slim
+
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY server/package*.json ./server/
+RUN npm install --prefix server
+
+COPY python_model/requirements.txt ./python_model/
+RUN pip3 install --no-cache-dir -r python_model/requirements.txt --break-system-packages
+
+COPY server/ ./server/
+COPY python_model/ ./python_model/
+
+ENV PYTHON_BIN=/usr/bin/python3
+ENV EMOTION_SCRIPT=/app/python_model/emotion_detection.py
+
+EXPOSE 4000
+
+CMD ["node", "server/src/index.js"]
