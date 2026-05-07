@@ -1,0 +1,16 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy server dependency manifests
+COPY server/package.json server/package-lock.json ./
+
+RUN npm ci
+
+# Copy server source
+COPY server/src/ ./src/
+COPY server/db/ ./db/
+
+EXPOSE 4000
+
+CMD ["node", "src/index.js"]

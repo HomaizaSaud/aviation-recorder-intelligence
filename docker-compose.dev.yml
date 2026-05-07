@@ -1,0 +1,37 @@
+version: "3.9"
+
+# Development override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Differences from base:
+#  - Frontend runs CRA dev server (hot reload) instead of nginx build
+#  - Backend source is mounted for live reload via nodemon
+#  - Python model source is mounted for live reload
+
+services:
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend.dev
+    environment:
+      - CHOKIDAR_USEPOLLING=true      # needed for Windows/WSL file watching
+      - WATCHPACK_POLLING=true
+      - REACT_APP_API_URL=http://localhost:4000
+    volumes:
+      - ./src:/app/src
+      - ./public:/app/public
+      - /app/node_modules            # keep container node_modules, don't override
+    ports:
+      - "3000:3000"
+
+  backend:
+    command: ["npx", "nodemon", "src/index.js"]
+    volumes:
+      - ./server/src:/app/src
+      - ./server/db:/app/db
+
+  python_model:
+    volumes:
+      - ./python_model:/app
+    command: ["uvicorn", "inference_service:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

@@ -1,0 +1,16 @@
+node_modules
+server/node_modules
+.next
+build
+.git
+.gitignore
+*.md
+.env
+.env.*
+!.env.example
+.myvenv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+docs
