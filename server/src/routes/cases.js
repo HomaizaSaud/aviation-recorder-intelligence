@@ -32,7 +32,8 @@ const {
   updateNote,
   deleteNote,
 } = require('../services/notes');
-const { analyzeFdrForCase } = require('../services/anomaly');
+const { analyzeFdrForCase, segmentFlightsForCase, detectPhasesForCase } = require('../services/anomaly');
+const { getFdrOccurrence, setFdrOccurrence } = require('../services/cases');
 const {
   denoiseCvrForCase,
   resolveDenoiseOutputPath,
@@ -90,6 +91,53 @@ router.get('/', async (req, res, next) => {
 router.post('/:caseNumber/fdr/analyze', async (req, res, next) => {
   try {
     const result = await analyzeFdrForCase(req.params.caseNumber, { user: req.user });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/segments', async (req, res, next) => {
+  try {
+    const result = await segmentFlightsForCase(req.params.caseNumber);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/phases', async (req, res, next) => {
+  try {
+    const result = await detectPhasesForCase(req.params.caseNumber);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/:caseNumber/fdr/occurrence', async (req, res, next) => {
+  try {
+    const result = await getFdrOccurrence(req.params.caseNumber);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.patch('/:caseNumber/fdr/occurrence', async (req, res, next) => {
+  try {
+    const { start, end, label } = req.body || {};
+    const result = await setFdrOccurrence(req.params.caseNumber, {
+      start: start == null ? null : Number(start),
+      end: end == null ? null : Number(end),
+      label: label == null ? null : String(label),
+    });
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
     res.json(result);
   } catch (error) {
     next(error);

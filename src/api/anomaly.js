@@ -174,6 +174,35 @@ const detectAnomaliesLocally = (rows = []) => {
   };
 };
 
+export const fetchFdrSegments = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/segments`, {
+    method: 'POST',
+  });
+  return response;
+};
+
+export const fetchFdrPhases = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/phases`, {
+    method: 'POST',
+  });
+  return response;
+};
+
+export const fetchFdrOccurrence = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/occurrence`, {
+    method: 'GET',
+  });
+  return response;
+};
+
+export const saveFdrOccurrence = async (caseId, { start, end, label }) => {
+  const response = await request(`/cases/${caseId}/fdr/occurrence`, {
+    method: 'PATCH',
+    body: JSON.stringify({ start, end, label }),
+  });
+  return response;
+};
+
 export const runFdrAnomalyDetection = async (caseId, { rows = [] } = {}) => {
   const payload = {};
 

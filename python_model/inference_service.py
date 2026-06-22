@@ -1,13 +1,22 @@
 """FastAPI inference service for the anomaly detection model."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+# Ensure the project root is on the path so segment module is importable
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from services.fdr_anomaly.segment import detect_flights_from_rows  # noqa: E402
+from services.fdr_anomaly.phase import detect_phases_from_rows  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -128,6 +137,99 @@ def predict(request: PredictRequest) -> PredictResponse:
         features=ARTIFACTS.features,
         anomalies=anomalies,
         scores=response_scores,
+    )
+
+
+# ── /segment endpoint (Task 6: GA-adaptive flight segmentation) ───────────────
+
+class SegmentRequest(BaseModel):
+    rows: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Rows of flight data including Session Time and sensor columns",
+    )
+
+    class Config:
+        extra = "allow"
+
+
+class FlightSegment(BaseModel):
+    flight_index: int
+    start_time: float
+    end_time: float
+    duration_s: float
+    duration_min: float
+    max_altitude_ft: Optional[float] = None
+    avg_ias_knots: Optional[float] = None
+    start_lat: Optional[float] = None
+    start_lon: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lon: Optional[float] = None
+
+
+class SegmentResponse(BaseModel):
+    n_rows: int
+    segments: List[FlightSegment]
+    detection_method: str
+    detection_badge: str
+
+
+@app.post("/segment", response_model=SegmentResponse)
+def segment(request: SegmentRequest) -> SegmentResponse:
+    if not request.rows:
+        raise HTTPException(status_code=400, detail="No rows supplied.")
+    try:
+        result = detect_flights_from_rows(request.rows)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return SegmentResponse(
+        n_rows=result["n_rows"],
+        segments=[FlightSegment(**s) for s in result["segments"]],
+        detection_method=result["detection_method"],
+        detection_badge=result["detection_badge"],
+    )
+
+
+# ── /phases endpoint (Task 7: GA flight phase detection) ──────────────────────
+
+class PhaseRequest(BaseModel):
+    rows: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Rows of flight data including Session Time and sensor columns",
+    )
+
+    class Config:
+        extra = "allow"
+
+
+class FlightPhase(BaseModel):
+    phase: str
+    start_time: float
+    end_time: float
+    duration_s: float
+
+
+class PhaseResponse(BaseModel):
+    n_rows: int
+    phases: List[FlightPhase]
+    detection_method: str
+    detection_badge: str
+
+
+@app.post("/phases", response_model=PhaseResponse)
+def phases(request: PhaseRequest) -> PhaseResponse:
+    if not request.rows:
+        raise HTTPException(status_code=400, detail="No rows supplied.")
+    try:
+        result = detect_phases_from_rows(request.rows)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return PhaseResponse(
+        n_rows=result["n_rows"],
+        phases=[FlightPhase(**p) for p in result["phases"]],
+        detection_method=result["detection_method"],
+        detection_badge=result["detection_badge"],
     )
 
 

@@ -10,16 +10,18 @@ import {
     Tooltip,
     Line,
     ReferenceLine,
+    ReferenceArea,
+    Legend,
 } from "recharts";
 import NotesPanel from "../components/NotesPanel";
 import { fetchCaseByNumber, updateCase } from "../api/cases";
-import { runFdrAnomalyDetection } from "../api/anomaly";
+import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence } from "../api/anomaly";
 import { useAuth } from "../hooks/useAuth";
 import useRecentCases from "../hooks/useRecentCases";
 import { buildCasePreview } from "../utils/caseDisplay";
 import { evaluateModuleReadiness } from "../utils/analysisAvailability";
 import { fetchAttachmentFromObjectStore } from "../utils/storage";
-import { fdrParameterMap } from "../config/fdr-parameters";
+import { fdrParameterMap, fdrParameterConfig } from "../config/fdr-parameters";
 import { createTimelineEntry, resolveActor } from "../utils/timeline";
 
 const defaultCaseOptions = [
@@ -79,6 +81,13 @@ const timeColumnExclusions = new Set([
     "session time",
     "system time",
     "gps date & time",
+    // NASA DFDAU time components (synthesised into elapsed seconds)
+    "gmt_hour",
+    "gmt_minute",
+    "gmt_min",
+    "gmt_sec",
+    // mat_to_excel row counter
+    "sample #",
 ]);
 
 const parameterGroupDefinitions = [
@@ -505,6 +514,33 @@ const formatNumericValue = (value) => {
     return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
 };
 
+// ── Phase detection constants (Task 7) ────────────────────────────────────────
+const PHASE_COLORS = {
+    TAKEOFF: "#22c55e",
+    CLIMB:   "#3b82f6",
+    CRUISE:  "#94a3b8",
+    DESCENT: "#f97316",
+    LANDING: "#ef4444",
+};
+
+const PHASE_OPACITY = {
+    TAKEOFF: 0.12,
+    CLIMB:   0.08,
+    CRUISE:  0.08,
+    DESCENT: 0.08,
+    LANDING: 0.12,
+};
+
+const PHASE_ORDER = ["TAKEOFF", "CLIMB", "CRUISE", "DESCENT", "LANDING"];
+
+const formatPhaseDuration = (seconds) => {
+    if (!Number.isFinite(seconds) || seconds < 0) return "0s";
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    const m = Math.floor(seconds / 60);
+    const s = Math.round(seconds % 60);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+};
+
 const formatAnalysisTimestamp = (value) => {
     if (!value) {
         return "—";
@@ -527,38 +563,85 @@ const formatAnalysisRunLabel = (timestamp, runMeta) => {
     return createdBy ? `${base} by ${createdBy}` : base;
 };
 
+const detectFdrCsvFormat = (headers) => {
+    const set = new Set(headers.map((h) => h.trim()));
+    if (set.has("Session Time")) return "ga";
+    if (set.has("GMT_HOUR")) return "nasa";
+    return "generic";
+};
+
 const normalizeFdrRows = (csvText) => {
+    // Binary Excel (xlsx = ZIP file) starts with the PK magic bytes.
+    // response.text() on a binary file decodes them as "PK" + control chars.
+    if (csvText.startsWith("PK")) {
+        const err = new Error(
+            "Excel (.xlsx) files cannot be previewed in the browser. " +
+            "Convert the file to CSV to see parameter charts here. " +
+            "The analysis will still run using the uploaded Excel file."
+        );
+        err.isExcelFormat = true;
+        throw err;
+    }
+
     const { headers, rows: rawRows } = parseCsvRows(csvText);
+    const format = detectFdrCsvFormat(headers);
+
+    // NASA mat_to_excel exports have a units row (all strings) as the first data row.
+    // Detect it by checking whether the first row has no numeric values at all.
+    let dataRows = rawRows;
+    if (format === "nasa" && rawRows.length > 0) {
+        const firstIsUnits = headers.every((h) => toNumber(rawRows[0][h]) === null);
+        if (firstIsUnits) dataRows = rawRows.slice(1);
+    }
+
     const numericHeaders = headers.filter(
         (header) =>
             !isExcludedTimeColumn(header) &&
-            rawRows.some((row) => toNumber(row[header]) !== null)
+            dataRows.some((row) => toNumber(row[header]) !== null)
     );
-    const timeSource = timeSources.session;
 
-    const rows = rawRows.map((row, index) => {
-        const sessionSeconds = parseSessionTime(row["Session Time"]);
+    // Pre-compute NASA base time so elapsed seconds start near 0.
+    let nasaBaseSeconds = 0;
+    if (format === "nasa" && dataRows.length > 0) {
+        const first = dataRows[0];
+        const h = toNumber(first["GMT_HOUR"]) ?? 0;
+        const m = toNumber(first["GMT_MINUTE"] !== undefined ? first["GMT_MINUTE"] : first["GMT_MIN"]) ?? 0;
+        const s = toNumber(first["GMT_SEC"]) ?? 0;
+        nasaBaseSeconds = h * 3600 + m * 60 + s;
+    }
+
+    const rows = dataRows.map((row, index) => {
         let normalizedTime = index;
-        normalizedTime = sessionSeconds !== null ? sessionSeconds : index;
-        const normalized = {
-            time: normalizedTime,
-            sessionTime: normalizedTime,
-            rowIndex: index,
-        };
 
+        if (format === "ga") {
+            const sessionSeconds = parseSessionTime(row["Session Time"]);
+            normalizedTime = sessionSeconds !== null ? sessionSeconds : index;
+        } else if (format === "nasa") {
+            const h = toNumber(row["GMT_HOUR"]) ?? 0;
+            const m = toNumber(row["GMT_MINUTE"] !== undefined ? row["GMT_MINUTE"] : row["GMT_MIN"]) ?? 0;
+            const s = toNumber(row["GMT_SEC"]) ?? 0;
+            normalizedTime = h * 3600 + m * 60 + s - nasaBaseSeconds;
+        } else {
+            // generic: use first time-like numeric column found
+            const timeCol = headers.find(
+                (h) => /time|sec|elapsed/i.test(h) && !isExcludedTimeColumn(h)
+            );
+            if (timeCol) {
+                const t = toNumber(row[timeCol]);
+                if (t !== null) normalizedTime = t;
+            }
+        }
+
+        const normalized = { time: normalizedTime, sessionTime: normalizedTime, rowIndex: index };
         numericHeaders.forEach((header) => {
             const value = toNumber(row[header]);
-            if (value !== null) {
-                normalized[header] = value;
-            }
+            if (value !== null) normalized[header] = value;
         });
-
         return normalized;
     });
 
     const sortedRows = [...rows].sort((a, b) => a.time - b.time);
-
-    return { rows: sortedRows, numericHeaders, timeSource };
+    return { rows: sortedRows, numericHeaders, timeSource: timeSources.session };
 };
 
 const hasNumericValue = (row, keys) =>
@@ -889,6 +972,24 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [expandedSegments, setExpandedSegments] = useState(() => new Set());
     const [anomalyResult, setAnomalyResult] = useState(null);
     const [anomalyError, setAnomalyError] = useState("");
+    const [flightSegments, setFlightSegments] = useState(null);
+    const [selectedFlightIndex, setSelectedFlightIndex] = useState(null);
+    const [segmentDetectionMethod, setSegmentDetectionMethod] = useState("");
+    const [segmentDetectionBadge, setSegmentDetectionBadge] = useState("groundspeed");
+    const [isLoadingSegments, setIsLoadingSegments] = useState(false);
+    const [segmentError, setSegmentError] = useState("");
+    const [flightPhases, setFlightPhases] = useState(null);
+    const [selectedPhaseKey, setSelectedPhaseKey] = useState(null);
+    const [phaseDetectionBadge, setPhaseDetectionBadge] = useState("vs_ias");
+    const [isLoadingPhases, setIsLoadingPhases] = useState(false);
+    const [phaseError, setPhaseError] = useState("");
+    const [occurrenceWindow, setOccurrenceWindow] = useState(null); // {start, end, label}
+    const [dragStartTime, setDragStartTime] = useState(null);
+    const [dragCurrentTime, setDragCurrentTime] = useState(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const [correlationParams, setCorrelationParams] = useState([]);
+    const [correlationSearch, setCorrelationSearch] = useState("");
+    const [correlationSelectorOpen, setCorrelationSelectorOpen] = useState(true);
     const [isLoadingFdrData, setIsLoadingFdrData] = useState(false);
     const [fdrDataError, setFdrDataError] = useState("");
     const [caseSummaryCopied, setCaseSummaryCopied] = useState(false);
@@ -896,6 +997,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [analysisRunMeta, setAnalysisRunMeta] = useState(null);
     const selectedCaseRef = useRef(null);
     const detectionStartRef = useRef(null);
+    const chartsRef = useRef(null);
     const isLinkedRoute = Boolean(caseNumber);
     const [workflowStage, setWorkflowStage] = useState(
         isLinkedRoute ? "analysis" : "caseSelection"
@@ -1093,7 +1195,10 @@ export default function FDR({ caseNumber: propCaseNumber }) {
             anomalyResult.sampleRows ||
             anomalyResult.samples;
 
-        return Array.isArray(list) ? list : [];
+        // Hard frontend cap — guards against stale DB records (pre-cap) or
+        // any future Python path that bypasses the server-side 10-segment limit.
+        const raw = Array.isArray(list) ? list : [];
+        return raw.slice(0, 10);
     }, [anomalyResult]);
     const analysisTitle = analysisLabel;
     const timeAxisLabel = "Session Time";
@@ -1106,6 +1211,23 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         },
         []
     );
+
+    const handleChartMouseDown = useCallback((chartEvent) => {
+        const time = chartEvent?.activeLabel;
+        if (typeof time !== "number" || !Number.isFinite(time)) return;
+        setDragStartTime(time);
+        setDragCurrentTime(time);
+        setIsDragging(true);
+    }, []);
+
+    const handleChartMouseMove = useCallback((chartEvent) => {
+        if (!isDragging) return;
+        const time = chartEvent?.activeLabel;
+        if (typeof time === "number" && Number.isFinite(time)) {
+            setDragCurrentTime(time);
+        }
+    }, [isDragging]);
+
     const timeDomain = useMemo(() => {
         const values = normalizedRows
             .map((row) => row.time)
@@ -1115,6 +1237,302 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         }
         return { min: Math.min(...values), max: Math.max(...values) };
     }, [normalizedRows]);
+
+    // Rows visible in charts — sliced to the selected flight segment when active.
+    const filteredRows = useMemo(() => {
+        if (selectedFlightIndex === null || !flightSegments || flightSegments.length === 0) {
+            return normalizedRows;
+        }
+        const seg = flightSegments.find((s) => s.flight_index === selectedFlightIndex);
+        if (!seg) return normalizedRows;
+        return normalizedRows.filter(
+            (r) => typeof r.time === "number" && r.time >= seg.start_time && r.time <= seg.end_time
+        );
+    }, [normalizedRows, flightSegments, selectedFlightIndex]);
+
+    const filteredParameterTableRows = useMemo(
+        () => buildParameterTable(filteredRows, availableParameters),
+        [filteredRows, availableParameters]
+    );
+
+    // Detection badge styling for the FlightSegmentSelector.
+    const segmentBadgeClass = useMemo(() => {
+        if (segmentDetectionBadge === "ias") {
+            return "bg-emerald-100 text-emerald-800 border border-emerald-200";
+        }
+        if (segmentDetectionBadge === "altitude") {
+            return "bg-amber-100 text-amber-800 border border-amber-200";
+        }
+        return "bg-gray-100 text-gray-600 border border-gray-200";
+    }, [segmentDetectionBadge]);
+
+    const segmentBadgeLabel = useMemo(() => {
+        if (segmentDetectionBadge === "ias") return "IAS-based";
+        if (segmentDetectionBadge === "altitude") return "Altitude-based";
+        return "Ground speed fallback";
+    }, [segmentDetectionBadge]);
+
+    // Rows visible in phase-filtered charts — stacks on top of filteredRows.
+    const chartRows = useMemo(() => {
+        if (!selectedPhaseKey || !flightPhases || flightPhases.length === 0) {
+            return filteredRows;
+        }
+        const phaseSegs = flightPhases.filter((p) => p.phase === selectedPhaseKey);
+        if (phaseSegs.length === 0) return filteredRows;
+        return filteredRows.filter(
+            (r) =>
+                typeof r.time === "number" &&
+                phaseSegs.some((seg) => r.time >= seg.start_time && r.time <= seg.end_time)
+        );
+    }, [filteredRows, flightPhases, selectedPhaseKey]);
+
+    // Per-param min/max over the current chartRows — used to normalize values 0-1
+    // and to un-normalize them in the tooltip formatter.
+    const correlationRanges = useMemo(() => {
+        if (correlationParams.length === 0) return {};
+        const ranges = {};
+        correlationParams.forEach((p) => {
+            let min = Infinity;
+            let max = -Infinity;
+            chartRows.forEach((row) => {
+                const v = row[p];
+                if (typeof v === "number" && !Number.isNaN(v)) {
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
+            });
+            if (Number.isFinite(min) && Number.isFinite(max)) {
+                ranges[p] = { min, max };
+            }
+        });
+        return ranges;
+    }, [chartRows, correlationParams]);
+
+    // Multi-param chart data: raw values downsampled then normalized per-param to [0, 1].
+    // Each row: { time, [param]: normalizedVal, [param+"__raw"]: actualVal }
+    const correlationChartData = useMemo(() => {
+        if (correlationParams.length === 0) return [];
+        const raw = chartRows
+            .filter((row) => typeof row.time === "number")
+            .map((row) => {
+                const point = { time: row.time };
+                correlationParams.forEach((p) => {
+                    const v = row[p];
+                    if (typeof v === "number" && !Number.isNaN(v)) {
+                        point[p] = v;
+                    }
+                });
+                return point;
+            });
+        const sampled = downsampleSeries(raw, 1200);
+        return sampled.map((point) => {
+            const out = { time: point.time };
+            correlationParams.forEach((p) => {
+                const r = correlationRanges[p];
+                const v = point[p];
+                if (r && typeof v === "number" && !Number.isNaN(v)) {
+                    const span = r.max - r.min;
+                    out[p] = span > 0 ? (v - r.min) / span : 0.5;
+                    out[p + "__raw"] = v;
+                }
+            });
+            return out;
+        });
+    }, [chartRows, correlationParams, correlationRanges]);
+
+    // Total duration per unique phase type (for legend display).
+    const phaseAggregate = useMemo(() => {
+        if (!flightPhases) return {};
+        return flightPhases.reduce((acc, p) => {
+            acc[p.phase] = (acc[p.phase] || 0) + p.duration_s;
+            return acc;
+        }, {});
+    }, [flightPhases]);
+
+    // Deduplicated/aggregated phases — guaranteed max 5 items regardless of
+    // how many raw segments Python returned. Used for ReferenceArea bands and
+    // the phase bar to prevent memory crashes on noisy high-frequency data.
+    const groupedPhases = useMemo(() => {
+        if (!flightPhases || flightPhases.length === 0) return [];
+        const agg = {};
+        flightPhases.forEach((seg) => {
+            if (!agg[seg.phase]) {
+                agg[seg.phase] = {
+                    phase: seg.phase,
+                    duration_s: seg.duration_s,
+                    start_time: seg.start_time,
+                    end_time: seg.end_time,
+                };
+            } else {
+                agg[seg.phase].duration_s += seg.duration_s;
+                agg[seg.phase].start_time = Math.min(agg[seg.phase].start_time, seg.start_time);
+                agg[seg.phase].end_time = Math.max(agg[seg.phase].end_time, seg.end_time);
+            }
+        });
+        return PHASE_ORDER.filter((ph) => agg[ph]).map((ph) => agg[ph]);
+    }, [flightPhases]);
+
+    const phaseBadgeClass = useMemo(() => {
+        if (phaseDetectionBadge === "vs_ias") {
+            return "bg-emerald-100 text-emerald-800 border border-emerald-200";
+        }
+        if (phaseDetectionBadge === "vs_only") {
+            return "bg-amber-100 text-amber-800 border border-amber-200";
+        }
+        return "bg-gray-100 text-gray-600 border border-gray-200";
+    }, [phaseDetectionBadge]);
+
+    const phaseBadgeLabel = useMemo(() => {
+        if (phaseDetectionBadge === "vs_ias") return "VS + IAS";
+        if (phaseDetectionBadge === "vs_only") return "VS only";
+        return "Altitude fallback";
+    }, [phaseDetectionBadge]);
+
+    // Auto-load flight segments whenever a new case with FDR data is opened.
+    useEffect(() => {
+        if (!caseNumber || !selectedCase?.source) {
+            setFlightSegments(null);
+            setSelectedFlightIndex(null);
+            setSegmentError("");
+            return;
+        }
+
+        const attachments = Array.isArray(selectedCase.source.attachments)
+            ? selectedCase.source.attachments
+            : [];
+        const hasFdr = attachments.some((item) => {
+            const type = (item?.type || "").toUpperCase();
+            const name = (item?.name || "").toLowerCase();
+            const key = item?.storage?.objectKey || item?.storage?.key;
+            return Boolean(key) && (type === "FDR" || name.endsWith(".csv") || name.includes("fdr"));
+        });
+
+        if (!hasFdr) {
+            setFlightSegments(null);
+            return;
+        }
+
+        let isMounted = true;
+        setIsLoadingSegments(true);
+        setSegmentError("");
+        setFlightSegments(null);
+        setSelectedFlightIndex(null);
+
+        fetchFdrSegments(caseNumber)
+            .then((result) => {
+                if (!isMounted) return;
+                setFlightSegments(result?.segments || []);
+                setSegmentDetectionMethod(result?.detection_method || "");
+                setSegmentDetectionBadge(result?.detection_badge || "groundspeed");
+            })
+            .catch((err) => {
+                if (!isMounted) return;
+                setSegmentError(err?.message || "Unable to detect flight segments.");
+            })
+            .finally(() => {
+                if (isMounted) setIsLoadingSegments(false);
+            });
+
+        return () => { isMounted = false; };
+    }, [caseNumber, selectedCase]);
+
+    // Auto-load flight phases in parallel with segment detection.
+    useEffect(() => {
+        if (!caseNumber || !selectedCase?.source) {
+            setFlightPhases(null);
+            setSelectedPhaseKey(null);
+            setPhaseError("");
+            return;
+        }
+
+        const attachments = Array.isArray(selectedCase.source.attachments)
+            ? selectedCase.source.attachments
+            : [];
+        const hasFdr = attachments.some((item) => {
+            const type = (item?.type || "").toUpperCase();
+            const name = (item?.name || "").toLowerCase();
+            const key = item?.storage?.objectKey || item?.storage?.key;
+            return Boolean(key) && (type === "FDR" || name.endsWith(".csv") || name.includes("fdr"));
+        });
+
+        if (!hasFdr) {
+            setFlightPhases(null);
+            return;
+        }
+
+        let isMounted = true;
+        setIsLoadingPhases(true);
+        setPhaseError("");
+        setFlightPhases(null);
+        setSelectedPhaseKey(null);
+
+        fetchFdrPhases(caseNumber)
+            .then((result) => {
+                if (!isMounted) return;
+                setFlightPhases(result?.phases || []);
+                setPhaseDetectionBadge(result?.detection_badge || "alt_only");
+            })
+            .catch((err) => {
+                if (!isMounted) return;
+                setPhaseError(err?.message || "Phase detection unavailable.");
+            })
+            .finally(() => {
+                if (isMounted) setIsLoadingPhases(false);
+            });
+
+        return () => { isMounted = false; };
+    }, [caseNumber, selectedCase]);
+
+    // Auto-load saved occurrence window when a case opens.
+    useEffect(() => {
+        if (!caseNumber) {
+            setOccurrenceWindow(null);
+            return;
+        }
+        fetchFdrOccurrence(caseNumber)
+            .then((result) => {
+                if (result?.start != null && result?.end != null) {
+                    setOccurrenceWindow(result);
+                } else {
+                    setOccurrenceWindow(null);
+                }
+            })
+            .catch(() => setOccurrenceWindow(null));
+    }, [caseNumber]);
+
+    // Global mouseup listener — captures drag release even when mouse leaves chart.
+    useEffect(() => {
+        if (!isDragging) return;
+        const handleMouseUp = () => {
+            setIsDragging(false);
+            setDragStartTime((startTime) => {
+                setDragCurrentTime((currentTime) => {
+                    if (startTime !== null && currentTime !== null) {
+                        const start = Math.min(startTime, currentTime);
+                        const end = Math.max(startTime, currentTime);
+                        if (end - start >= 1) {
+                            setFlightPhases((phases) => {
+                                const mid = (start + end) / 2;
+                                const matchedPhase = Array.isArray(phases)
+                                    ? phases.find((p) => mid >= p.start_time && mid <= p.end_time)
+                                    : null;
+                                const label = matchedPhase?.phase ?? "";
+                                const newWindow = { start, end, label };
+                                setOccurrenceWindow(newWindow);
+                                saveFdrOccurrence(caseNumber, newWindow).catch(() => {});
+                                return phases; // no change to phases
+                            });
+                        }
+                    }
+                    return null;
+                });
+                return null;
+            });
+        };
+        window.addEventListener("mouseup", handleMouseUp);
+        return () => window.removeEventListener("mouseup", handleMouseUp);
+    }, [isDragging, caseNumber]);
+
     const timeIndexMap = useMemo(() => {
         const map = new Map();
         normalizedRows.forEach((row) => {
@@ -1443,6 +1861,12 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     return;
                 }
 
+                if (error?.isExcelFormat) {
+                    // Excel file — analysis still runs server-side, just no client preview
+                    setFdrDataError(error.message);
+                    return;
+                }
+
                 setDetectionTrendData(defaultDetectionTrendSamples);
                 setParameterTableRows(defaultParameterTableRows);
                 setAvailableParameters([]);
@@ -1601,6 +2025,38 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 analysis_version: result?.analysis_version || "1.0",
             };
             setAnomalyResult(normalizedResult);
+
+            // Auto-derive occurrence window from the highest-severity anomaly segment
+            const autoSegments = normalizedResult?.segments;
+            if (Array.isArray(autoSegments) && autoSegments.length > 0) {
+                const SEVERITY_RANK = { high: 3, med: 2, low: 1 };
+                const best = autoSegments.reduce((prev, cur) => {
+                    if (cur.score_peak !== prev.score_peak)
+                        return cur.score_peak > prev.score_peak ? cur : prev;
+                    const curRank = SEVERITY_RANK[cur.severity?.toLowerCase()] ?? 0;
+                    const prevRank = SEVERITY_RANK[prev.severity?.toLowerCase()] ?? 0;
+                    return curRank > prevRank ? cur : prev;
+                });
+                if (best.end_time - best.start_time >= 1) {
+                    const winStart = best.start_time;
+                    const winEnd = best.end_time;
+                    setFlightPhases((phases) => {
+                        const mid = (winStart + winEnd) / 2;
+                        const matched = Array.isArray(phases)
+                            ? phases.find((p) => mid >= p.start_time && mid <= p.end_time)
+                            : null;
+                        const label = matched?.phase ?? "";
+                        const newWindow = { start: winStart, end: winEnd, label };
+                        setOccurrenceWindow(newWindow);
+                        saveFdrOccurrence(caseNumber, newWindow).catch(() => {});
+                        return phases;
+                    });
+                    setTimeout(() => {
+                        chartsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+                    }, 300);
+                }
+            }
+
             setAnalysisTimestamp(updatedAt);
             setAnalysisRunMeta(runMeta);
             setSelectedCase((prev) =>
@@ -1821,6 +2277,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         [anomalyResult, mapTimeValue]
     );
     const [showAllParameters, setShowAllParameters] = useState(false);
+    const [severityFilter, setSeverityFilter] = useState("all");
+    const pendingScrollToChartsRef = useRef(false);
 
     const formatSegmentTimeRange = (segment, index) => {
         const startTime = segment?.start_time ?? segment?.startTime ?? segment?.time;
@@ -2025,6 +2483,83 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         [parameterDisplayMap]
     );
 
+    const getSegmentPhaseLabel = useCallback(
+        (segment) => {
+            if (!Array.isArray(flightPhases) || flightPhases.length === 0) return null;
+            const mid =
+                ((segment?.start_time ?? 0) + (segment?.end_time ?? segment?.start_time ?? 0)) / 2;
+            const match = flightPhases.find((p) => mid >= p.start_time && mid <= p.end_time);
+            return match?.phase ?? null;
+        },
+        [flightPhases]
+    );
+
+    const getDriverDeviationLabel = useCallback((driver) => {
+        const stats = driver?.stats;
+        if (!stats) return null;
+        const { segment_max, segment_min, baseline_median } = stats;
+        if (!Number.isFinite(baseline_median) || baseline_median === 0) return null;
+        const extreme =
+            Math.abs(segment_max - baseline_median) >= Math.abs(segment_min - baseline_median)
+                ? segment_max
+                : segment_min;
+        const pct = ((extreme - baseline_median) / Math.abs(baseline_median)) * 100;
+        if (!Number.isFinite(pct) || Math.abs(pct) < 1) return null;
+        return `${pct >= 0 ? "↑" : "↓"}${Math.round(Math.abs(pct))}%`;
+    }, []);
+
+    const handleJumpToSegment = useCallback(
+        (segment) => {
+            const start = segment?.start_time;
+            const end = segment?.end_time ?? start;
+            if (!Number.isFinite(start)) return;
+            const label = getSegmentPhaseLabel(segment) ?? "";
+            const newWindow = { start, end, label };
+            setOccurrenceWindow(newWindow);
+            saveFdrOccurrence(caseNumber, newWindow).catch(() => {});
+            setWorkflowStage("analysis");
+            // Scroll directly — don't rely on useEffect since we may already be
+            // on the analysis stage (stage doesn't change → effect never fires)
+            setTimeout(() => {
+                chartsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+            }, 400);
+        },
+        [caseNumber, getSegmentPhaseLabel]
+    );
+
+    const extraSegmentsOmitted = anomalyResult?.summary?.extra_segments_omitted ?? 0;
+
+    const filteredSegments = useMemo(() => {
+        if (severityFilter === "all") return segments;
+        return segments.filter((s) => {
+            const sev = (s?.severity ?? "low").toLowerCase();
+            return sev === severityFilter;
+        });
+    }, [segments, severityFilter]);
+
+    useEffect(() => {
+        if (!pendingScrollToChartsRef.current) return;
+        if (workflowStage !== "analysis") return;
+        pendingScrollToChartsRef.current = false;
+        setTimeout(() => {
+            chartsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 300);
+    }, [workflowStage]);
+
+    // Default correlation param selection: pick the first present of the priority 4.
+    // Only runs when availableParameters loads; doesn't clobber user changes.
+    useEffect(() => {
+        if (!availableParameters || availableParameters.length === 0) return;
+        const PRIORITY = [
+            "Indicated Airspeed (knots)",
+            "Vertical Speed (ft/min)",
+            "Pitch (deg)",
+            "Roll (deg)",
+        ];
+        const defaults = PRIORITY.filter((p) => availableParameters.includes(p));
+        setCorrelationParams((prev) => (prev.length === 0 ? defaults : prev));
+    }, [availableParameters]);
+
     const caseSummary = useMemo(() => {
         if (!anomalyResult) {
             return null;
@@ -2127,7 +2662,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         }
         const lower = bounds.startTime;
         const upper = bounds.endTime;
-        const rawData = normalizedRows
+        const rawData = filteredRows
             .map((row) => ({
                 time: row.time,
                 value: row[parameter],
@@ -2153,7 +2688,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
             color: colorPalette[0],
         };
         const chartData = downsampleSeries(
-            normalizedRows
+            chartRows
                 .map((row) => ({
                     time: row.time,
                     value: row[parameter],
@@ -2190,6 +2725,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             <ComposedChart
                                 data={chartData}
                                 margin={{ top: 12, right: 16, left: 0, bottom: 0 }}
+                                onMouseDown={handleChartMouseDown}
+                                onMouseMove={handleChartMouseMove}
                             >
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                                 <XAxis
@@ -2212,6 +2749,62 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         `${timeAxisLabel}: ${formatFlightTime(value)}`
                                     }
                                 />
+                                {groupedPhases.map((p) => (
+                                    <ReferenceArea
+                                        key={p.phase}
+                                        x1={p.start_time}
+                                        x2={p.end_time}
+                                        fill={PHASE_COLORS[p.phase] || "#94a3b8"}
+                                        fillOpacity={
+                                            p.phase === "TAKEOFF" || p.phase === "LANDING"
+                                                ? 0.12
+                                                : 0.08
+                                        }
+                                        ifOverflow="hidden"
+                                    />
+                                ))}
+                                {/* Drag preview band */}
+                                {isDragging && dragStartTime !== null && dragCurrentTime !== null && (
+                                    <ReferenceArea
+                                        x1={Math.min(dragStartTime, dragCurrentTime)}
+                                        x2={Math.max(dragStartTime, dragCurrentTime)}
+                                        fill="#f59e0b"
+                                        fillOpacity={0.10}
+                                        stroke="#fbbf24"
+                                        strokeDasharray="3 2"
+                                        ifOverflow="hidden"
+                                    />
+                                )}
+                                {/* Saved occurrence band — renders on top of phase bands */}
+                                {occurrenceWindow?.start != null && occurrenceWindow?.end != null && (
+                                    <ReferenceArea
+                                        x1={occurrenceWindow.start}
+                                        x2={occurrenceWindow.end}
+                                        fill="#f59e0b"
+                                        fillOpacity={0.22}
+                                        stroke="#d97706"
+                                        strokeWidth={1}
+                                        ifOverflow="hidden"
+                                    />
+                                )}
+                                {/* Center dashed line + label */}
+                                {occurrenceWindow?.start != null && occurrenceWindow?.end != null && (
+                                    <ReferenceLine
+                                        x={(occurrenceWindow.start + occurrenceWindow.end) / 2}
+                                        stroke="#92400e"
+                                        strokeDasharray="4 3"
+                                        strokeWidth={1.5}
+                                        label={{
+                                            value: occurrenceWindow.label
+                                                ? `Occurrence · ${occurrenceWindow.label}`
+                                                : "Occurrence",
+                                            position: "insideTopRight",
+                                            fill: "#92400e",
+                                            fontSize: 10,
+                                            fontWeight: 600,
+                                        }}
+                                    />
+                                )}
                                 <Line
                                     type={renderConfig.lineType || "monotone"}
                                     dataKey="value"
@@ -2810,6 +3403,125 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     </div>
                 </header>
 
+                {/* Analysis Complete banner + Most Critical Finding hero card */}
+                <div className="space-y-3">
+                    <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+                        <svg
+                            className="h-5 w-5 flex-shrink-0 text-emerald-600"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                            strokeWidth={2}
+                        >
+                            <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                d="M5 13l4 4L19 7"
+                            />
+                        </svg>
+                        <div>
+                            <p className="text-sm font-semibold text-emerald-800">
+                                Analysis Complete
+                            </p>
+                            <p className="text-xs text-emerald-700">
+                                {typeof anomalyCount === "number" ? anomalyCount : 0}{" "}
+                                segment{anomalyCount !== 1 ? "s" : ""} flagged
+                                {typeof flaggedPercent === "number"
+                                    ? ` · ${flaggedPercent.toFixed(1)}% of flight`
+                                    : ""}
+                                {analysisTimestamp
+                                    ? ` · ${formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}`
+                                    : ""}
+                            </p>
+                        </div>
+                    </div>
+
+                    {segments.length > 0 &&
+                        (() => {
+                            const topSeg = segments[0];
+                            const topTone = getSeverityTone(topSeg?.severity);
+                            const topRange = formatSegmentTimeRange(topSeg, 0);
+                            const topPhase = getSegmentPhaseLabel(topSeg);
+                            const topDriversList = resolveSegmentDrivers(topSeg).slice(0, 2);
+                            const topScore =
+                                topSeg?.score_peak != null
+                                    ? (() => { const s = Number(topSeg.score_peak); return s >= 0.1 ? s.toFixed(2) : s < 0.001 ? s.toExponential(2) : s.toFixed(4); })()
+                                    : null;
+                            return (
+                                <div
+                                    className={`rounded-xl border p-4 space-y-2 ${topTone.evidencePanel}`}
+                                >
+                                    <p className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+                                        Most Critical Finding
+                                    </p>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <span
+                                            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${topTone.badge}`}
+                                        >
+                                            {formatSeverityLabel(topSeg?.severity)}
+                                        </span>
+                                        {topPhase && (
+                                            <span className="text-xs font-medium text-gray-600">
+                                                {topPhase}
+                                            </span>
+                                        )}
+                                        <span className="text-xs text-gray-500">
+                                            {topRange}
+                                        </span>
+                                        {topScore != null && (
+                                            <span className="ml-auto font-mono text-xs text-gray-400">
+                                                score {topScore}
+                                            </span>
+                                        )}
+                                    </div>
+                                    {topDriversList.length > 0 && (
+                                        <p className="text-xs text-gray-700">
+                                            {topDriversList.map((d, di) => {
+                                                const dev = getDriverDeviationLabel(d);
+                                                return (
+                                                    <span key={d.param ?? di}>
+                                                        {di > 0 && (
+                                                            <span className="mx-1 text-gray-300">
+                                                                ·
+                                                            </span>
+                                                        )}
+                                                        <span className="font-medium">
+                                                            {d.label}
+                                                        </span>
+                                                        {dev && (
+                                                            <span
+                                                                className={`ml-1 font-semibold ${
+                                                                    dev.startsWith("↑")
+                                                                        ? "text-red-600"
+                                                                        : "text-blue-600"
+                                                                }`}
+                                                            >
+                                                                {dev}
+                                                            </span>
+                                                        )}
+                                                    </span>
+                                                );
+                                            })}
+                                        </p>
+                                    )}
+                                    <button
+                                        type="button"
+                                        onClick={() => handleJumpToSegment(topSeg)}
+                                        className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition ${topTone.actionText} ${topTone.evidencePanel}`}
+                                    >
+                                        View on charts ↗
+                                    </button>
+                                </div>
+                            );
+                        })()}
+
+                    {noAnomaliesDetected && (
+                        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                            No segments flagged for the current run.
+                        </div>
+                    )}
+                </div>
+
                 <section className="rounded-3xl bg-white p-6 border border-gray-200">
                     <div className="flex items-center justify-between">
                         <div>
@@ -2853,6 +3565,39 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         }}
                                     />
                                 )}
+                                {occurrenceWindow?.start != null &&
+                                    occurrenceWindow?.end != null && (
+                                        <ReferenceArea
+                                            x1={occurrenceWindow.start}
+                                            x2={occurrenceWindow.end}
+                                            fill="#f59e0b"
+                                            fillOpacity={0.2}
+                                            stroke="#f59e0b"
+                                            strokeOpacity={0.5}
+                                            strokeWidth={1}
+                                        />
+                                    )}
+                                {occurrenceWindow?.start != null &&
+                                    occurrenceWindow?.end != null && (
+                                        <ReferenceLine
+                                            x={
+                                                (occurrenceWindow.start +
+                                                    occurrenceWindow.end) /
+                                                2
+                                            }
+                                            stroke="#f59e0b"
+                                            strokeDasharray="4 3"
+                                            strokeWidth={1.5}
+                                            label={{
+                                                value: occurrenceWindow.label
+                                                    ? `Occurrence · ${occurrenceWindow.label}`
+                                                    : "Occurrence",
+                                                position: "top",
+                                                fill: "#b45309",
+                                                fontSize: 10,
+                                            }}
+                                        />
+                                    )}
                                 <Line
                                     type="monotone"
                                     dataKey={scoreTimelineData.length ? "score" : "AIRSPEED"}
@@ -3045,25 +3790,58 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 )}
 
                 <section className="rounded-3xl bg-white p-6 border border-gray-200">
-                    <div className="flex items-center justify-between mb-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
                         <div>
                             <h2 className="text-lg font-semibold text-gray-900">
-                                Flagged Events (Evidence View)
+                                All Findings ({segments.length})
                             </h2>
                             <p className="text-sm text-gray-500">
                                 Evidence-ready review of flagged intervals and contributing parameters.
                             </p>
                         </div>
-                        <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
-                            {anomalyCount ?? 0} segments flagged
-                            {typeof flaggedPercent === "number"
-                                ? ` (${flaggedPercent.toFixed(1)}% of flight)`
-                                : ""}
-                        </span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                            {["all", "high", "med", "low"].map((f) => {
+                                const fCount =
+                                    f === "all"
+                                        ? segments.length
+                                        : segments.filter(
+                                              (s) =>
+                                                  (s?.severity ?? "low").toLowerCase() === f
+                                          ).length;
+                                const fActive = severityFilter === f;
+                                const fColors = {
+                                    all: fActive
+                                        ? "bg-gray-900 text-white border-gray-900"
+                                        : "bg-white text-gray-600 border-gray-200 hover:bg-gray-50",
+                                    high: fActive
+                                        ? "bg-red-600 text-white border-red-600"
+                                        : "bg-white text-red-700 border-red-200 hover:bg-red-50",
+                                    med: fActive
+                                        ? "bg-amber-500 text-white border-amber-500"
+                                        : "bg-white text-amber-700 border-amber-200 hover:bg-amber-50",
+                                    low: fActive
+                                        ? "bg-blue-500 text-white border-blue-500"
+                                        : "bg-white text-blue-700 border-blue-200 hover:bg-blue-50",
+                                };
+                                return (
+                                    <button
+                                        key={f}
+                                        type="button"
+                                        onClick={() => setSeverityFilter(f)}
+                                        className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${fColors[f]}`}
+                                    >
+                                        {f === "all"
+                                            ? "All"
+                                            : f.charAt(0).toUpperCase() + f.slice(1)}{" "}
+                                        ({fCount})
+                                    </button>
+                                );
+                            })}
+                        </div>
                     </div>
                     <div className="space-y-3">
-                        {segments.length > 0 ? (
-                            segments.map((segment, index) => {
+                        {filteredSegments.length > 0 ? (
+                            filteredSegments.map((segment, index) => {
                                 const segmentKey = `${segment?.start_time ?? "seg"}-${index}`;
                                 const isExpanded = expandedSegments.has(segmentKey);
                                 const topDrivers = resolveSegmentDrivers(segment);
@@ -3073,52 +3851,89 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                 const timeBounds = resolveSegmentTimeBounds(segment);
                                 const interpretation = resolveSegmentInterpretation(segment);
 
+                                const phaseLabel = getSegmentPhaseLabel(segment);
+                                const topTwoDrivers = topDrivers.slice(0, 2);
+                                const scorePeak =
+                                    segment?.score_peak != null
+                                        ? (() => { const s = Number(segment.score_peak); return s >= 0.1 ? s.toFixed(2) : s < 0.001 ? s.toExponential(2) : s.toFixed(4); })()
+                                        : null;
+
                                 return (
                                     <div
                                         key={segmentKey}
                                         className="rounded-2xl border border-gray-200 bg-white shadow-sm"
                                     >
-                                        <button
-                                            type="button"
-                                            onClick={() => handleToggleSegment(segmentKey)}
-                                            className="flex w-full flex-col gap-3 px-4 py-4 text-left transition hover:bg-gray-50 md:flex-row md:items-center md:justify-between"
-                                        >
-                                            <div className="space-y-1">
-                                                <p className="text-xs uppercase tracking-[0.25em] text-gray-400">
-                                                    Segment {index + 1}
-                                                </p>
-                                                <p className="text-sm font-semibold text-gray-900">
-                                                    {timeRange}
-                                                </p>
-                                                <p className="text-xs text-gray-500">
-                                                    {topDrivers.length > 0
-                                                        ? topDrivers
-                                                              .map((driver) => driver.label)
-                                                              .join(", ")
-                                                        : "No drivers reported."}
-                                                </p>
-                                                {interpretation.tags.length > 0 && (
-                                                    <p className="text-xs text-gray-500">
-                                                        Possible interpretation:{" "}
-                                                        <span className="font-semibold text-gray-700">
-                                                            {interpretation.tags.join(" · ")}
+                                        <div className="flex w-full items-start gap-2 px-4 py-4">
+                                            <button
+                                                type="button"
+                                                onClick={() => handleJumpToSegment(segment)}
+                                                className="flex flex-1 flex-col gap-1.5 text-left transition hover:opacity-80"
+                                            >
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <span
+                                                        className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${severityTone.badge}`}
+                                                    >
+                                                        {severity}
+                                                    </span>
+                                                    {phaseLabel && (
+                                                        <span className="text-xs font-medium text-gray-500">
+                                                            {phaseLabel}
                                                         </span>
+                                                    )}
+                                                    <span className="text-xs text-gray-400">
+                                                        {timeRange}
+                                                    </span>
+                                                    {scorePeak != null && (
+                                                        <span className="ml-auto font-mono text-xs text-gray-400">
+                                                            score {scorePeak}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                {topTwoDrivers.length > 0 && (
+                                                    <p className="text-xs text-gray-600">
+                                                        {topTwoDrivers.map((d, di) => {
+                                                            const dev = getDriverDeviationLabel(d);
+                                                            return (
+                                                                <span key={d.param ?? di}>
+                                                                    {di > 0 && (
+                                                                        <span className="mx-1 text-gray-300">
+                                                                            ·
+                                                                        </span>
+                                                                    )}
+                                                                    <span className="font-medium text-gray-700">
+                                                                        {d.label}
+                                                                    </span>
+                                                                    {dev && (
+                                                                        <span
+                                                                            className={`ml-1 font-semibold ${
+                                                                                dev.startsWith("↑")
+                                                                                    ? "text-red-600"
+                                                                                    : "text-blue-600"
+                                                                            }`}
+                                                                        >
+                                                                            {dev}
+                                                                        </span>
+                                                                    )}
+                                                                </span>
+                                                            );
+                                                        })}
                                                     </p>
                                                 )}
-                                            </div>
-                                            <div className="flex items-center gap-3">
-                                                <span
-                                                    className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${severityTone.badge}`}
+                                                <p
+                                                    className={`text-xs font-medium ${severityTone.actionText}`}
                                                 >
-                                                    {severity}
-                                                </span>
-                                                <span
-                                                    className={`text-xs font-semibold ${severityTone.actionText}`}
-                                                >
-                                                    {isExpanded ? "Hide evidence" : "View evidence"}
-                                                </span>
-                                            </div>
-                                        </button>
+                                                    View on charts ↗
+                                                </p>
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => handleToggleSegment(segmentKey)}
+                                                className="flex-shrink-0 rounded-lg border border-gray-200 px-3 py-2 text-xs text-gray-500 transition hover:bg-gray-50"
+                                                title={isExpanded ? "Hide evidence" : "Show evidence"}
+                                            >
+                                                {isExpanded ? "▲" : "▼"}
+                                            </button>
+                                        </div>
 
                                         {isExpanded && (
                                             <div
@@ -3330,8 +4145,17 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             })
                         ) : (
                             <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-4 py-6 text-center text-sm text-gray-500">
-                                No segments returned for this run.
+                                {severityFilter === "all"
+                                    ? "No segments returned for this run."
+                                    : `No ${severityFilter}-severity segments found.`}
                             </div>
+                        )}
+                        {extraSegmentsOmitted > 0 && (
+                            <p className="pt-2 text-center text-xs text-gray-400">
+                                and {extraSegmentsOmitted} more low-severity finding
+                                {extraSegmentsOmitted !== 1 ? "s" : ""} omitted from this
+                                report
+                            </p>
                         )}
                     </div>
                 </section>
@@ -3476,126 +4300,705 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 )}
 
                 {(isRunningDetection || anomalyResult || anomalyError) && (
-                    <div className="rounded-lg border border-gray-200 bg-white/60 p-4 space-y-3">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <p className="text-sm font-semibold text-gray-800">
-                                    Latest Analysis Results (read-only)
-                                </p>
-                                <p className="text-xs text-gray-500">
-                                    Latest run for {selectedCase?.id || caseNumber || "current case"}
-                                    {analysisTimestamp
-                                        ? ` · ${formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}`
-                                        : ""}
-                                </p>
+                    <div className="space-y-3">
+                        {isRunningDetection && !anomalyResult && (
+                            <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+                                <svg
+                                    className="h-4 w-4 animate-spin text-emerald-600"
+                                    fill="none"
+                                    viewBox="0 0 24 24"
+                                >
+                                    <circle
+                                        className="opacity-25"
+                                        cx="12"
+                                        cy="12"
+                                        r="10"
+                                        stroke="currentColor"
+                                        strokeWidth="4"
+                                    />
+                                    <path
+                                        className="opacity-75"
+                                        fill="currentColor"
+                                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                                    />
+                                </svg>
+                                Analysing…
                             </div>
-                            {isRunningDetection && (
-                                <span className="text-xs font-semibold text-emerald-700">Running...</span>
-                            )}
-                        </div>
+                        )}
 
                         {anomalyResult && (
-                            <>
-                                <p className="text-sm text-gray-700">
-                                    <span className="text-2xl font-bold text-emerald-600">
-                                        {typeof anomalyCount === "number"
-                                            ? anomalyCount.toLocaleString()
-                                            : "—"}
-                                    </span>
-                                    <span className="ml-2 text-xs uppercase tracking-wide text-gray-500">
-                                        segments flagged
-                                    </span>
-                                </p>
-
-                                <p className="text-xs text-gray-500">
-                                    <span className="font-semibold text-gray-800">Analysis:</span>
-                                    <span className="ml-1">{analysisTitle}</span>
-                                    <span className="ml-3 font-semibold text-gray-800">Total rows:</span>
-                                    <span className="ml-1 text-gray-700">
-                                        {typeof totalRows === "number" ? totalRows.toLocaleString() : "—"}
-                                    </span>
-                                </p>
-
-                                {topAnomalyParameters.length > 0 && (
-                                    <div className="space-y-1 mt-2">
-                                        <p className="text-xs font-semibold text-gray-700">
-                                            Parameters with most flagged segments
-                                        </p>
-                                        <ul className="text-sm text-gray-700 space-y-1">
-                                            {topAnomalyParameters.map(({ name, count }) => (
-                                                <li
-                                                    key={`${name}-${count}`}
-                                                    className="flex items-center justify-between"
-                                                >
-                                                    <span>{name}</span>
-                                                    <span className="text-xs text-gray-500">
-                                                        {count} {count === 1 ? "segment" : "segments"}
-                                                    </span>
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    </div>
-                                )}
-
-                                {noAnomaliesDetected && (
-                                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-                                        No segments flagged for the current run.
-                                    </div>
-                                )}
-
-                                {!noAnomaliesDetected && (
-                                    <div className="space-y-2">
-                                        <p className="text-xs font-semibold text-gray-700">Sample segments</p>
-                                        {segments.length > 0 ? (
-                                            <ul className="space-y-2">
-                                                {segments.slice(0, 5).map((segment, index) => {
-                                                    const severity = segment?.severity || "low";
-                                                    const timeRange = formatSegmentTimeRange(
-                                                        segment,
-                                                        index
-                                                    );
-
-                                                    return (
-                                                        <li
-                                                            key={`${timeRange}-${index}`}
-                                                            className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm space-y-1"
-                                                        >
-                                                            <div className="flex items-center justify-between">
-                                                                <span className="font-semibold text-gray-800">
-                                                                    Segment {index + 1}
-                                                                </span>
-                                                                {severity && (
-                                                                    <span className={`text-xs rounded-full px-2 py-0.5 font-semibold ${getSeverityTone(severity).badge}`}>
-                                                                        {severity}
-                                                                    </span>
-                                                                )}
-                                                            </div>
-                                                            <p className="text-xs text-gray-600 break-words">
-                                                                {segment?.explanation ||
-                                                                    `${timeAxisLabel}: ${timeRange}`}
-                                                            </p>
-                                                        </li>
-                                                    );
-                                                })}
-                                            </ul>
-                                        ) : (
-                                            <p className="text-sm text-gray-500">
-                                                No segments returned for this run.
-                                            </p>
-                                        )}
-                                    </div>
-                                )}
-                            </>
+                            <button
+                                type="button"
+                                onClick={() => setWorkflowStage("results")}
+                                className="w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 transition"
+                            >
+                                View Analysis Results →
+                            </button>
                         )}
                     </div>
                 )}
             </section>
 
-            <section className="bg-white border border-gray-200 rounded-xl p-6 space-y-6">
+            {/* ── Flight Segment Selector (Task 6) ───────────────────────────────── */}
+            {isLoadingSegments && (
+                <div className="rounded-lg border border-emerald-100 bg-emerald-50 px-4 py-2 text-xs text-emerald-700">
+                    Detecting flight segments…
+                </div>
+            )}
+            {segmentError && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
+                    {segmentError}
+                </div>
+            )}
+            {!isLoadingSegments && flightSegments && flightSegments.length === 1 && (
+                <div className="flex flex-wrap items-center gap-3 rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 shadow-sm">
+                    <span className="font-semibold text-gray-800">Single flight detected</span>
+                    {flightSegments[0].duration_min != null && (
+                        <span>· {flightSegments[0].duration_min} min</span>
+                    )}
+                    {flightSegments[0].max_altitude_ft != null && (
+                        <span>· {flightSegments[0].max_altitude_ft.toLocaleString()} ft max alt</span>
+                    )}
+                    {flightSegments[0].avg_ias_knots != null && (
+                        <span>· {flightSegments[0].avg_ias_knots} kts avg IAS</span>
+                    )}
+                    <span
+                        className={`ml-auto rounded-full px-2.5 py-0.5 text-xs font-semibold ${segmentBadgeClass}`}
+                        title={segmentDetectionMethod}
+                    >
+                        {segmentBadgeLabel}
+                    </span>
+                </div>
+            )}
+            {!isLoadingSegments && flightSegments && flightSegments.length > 1 && (
+                <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                            <h2 className="text-sm font-semibold text-gray-900">
+                                Flights Detected
+                                <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                                    {flightSegments.length}
+                                </span>
+                            </h2>
+                            <p className="text-xs text-gray-500 mt-0.5">
+                                Select a flight to filter all charts to that segment.
+                            </p>
+                        </div>
+                        <span
+                            className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${segmentBadgeClass}`}
+                            title={segmentDetectionMethod}
+                        >
+                            {segmentBadgeLabel}
+                        </span>
+                    </div>
+                    {/* Pill selectors */}
+                    <div className="flex flex-wrap gap-2">
+                        <button
+                            type="button"
+                            onClick={() => setSelectedFlightIndex(null)}
+                            className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                                selectedFlightIndex === null
+                                    ? "border-emerald-500 bg-emerald-600 text-white"
+                                    : "border-gray-200 text-gray-600 hover:border-emerald-300 hover:text-emerald-700"
+                            }`}
+                        >
+                            All Flights
+                        </button>
+                        {flightSegments.map((seg) => (
+                            <button
+                                key={seg.flight_index}
+                                type="button"
+                                onClick={() =>
+                                    setSelectedFlightIndex(
+                                        selectedFlightIndex === seg.flight_index ? null : seg.flight_index
+                                    )
+                                }
+                                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                                    selectedFlightIndex === seg.flight_index
+                                        ? "border-emerald-500 bg-emerald-600 text-white"
+                                        : "border-gray-200 text-gray-600 hover:border-emerald-300 hover:text-emerald-700"
+                                }`}
+                            >
+                                Flight {seg.flight_index}
+                            </button>
+                        ))}
+                    </div>
+                    {/* Segment table */}
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                            <thead className="bg-gray-50 text-gray-500 uppercase tracking-wide">
+                                <tr>
+                                    <th className="px-3 py-2 text-left">#</th>
+                                    <th className="px-3 py-2 text-left">Start</th>
+                                    <th className="px-3 py-2 text-left">End</th>
+                                    <th className="px-3 py-2 text-left">Duration</th>
+                                    <th className="px-3 py-2 text-right">Max Alt</th>
+                                    <th className="px-3 py-2 text-right">Avg IAS</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                                {flightSegments.map((seg) => {
+                                    const isActive = selectedFlightIndex === seg.flight_index;
+                                    return (
+                                        <tr
+                                            key={seg.flight_index}
+                                            onClick={() =>
+                                                setSelectedFlightIndex(
+                                                    isActive ? null : seg.flight_index
+                                                )
+                                            }
+                                            className={`cursor-pointer transition ${
+                                                isActive
+                                                    ? "bg-emerald-50 font-semibold text-emerald-900"
+                                                    : "text-gray-700 hover:bg-gray-50"
+                                            }`}
+                                        >
+                                            <td className="px-3 py-2">{seg.flight_index}</td>
+                                            <td className="px-3 py-2">{formatSessionTime(seg.start_time)}</td>
+                                            <td className="px-3 py-2">{formatSessionTime(seg.end_time)}</td>
+                                            <td className="px-3 py-2">{seg.duration_min} min</td>
+                                            <td className="px-3 py-2 text-right">
+                                                {seg.max_altitude_ft != null
+                                                    ? `${seg.max_altitude_ft.toLocaleString()} ft`
+                                                    : "—"}
+                                            </td>
+                                            <td className="px-3 py-2 text-right">
+                                                {seg.avg_ias_knots != null
+                                                    ? `${seg.avg_ias_knots} kts`
+                                                    : "—"}
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                    {selectedFlightIndex !== null && (
+                        <p className="text-xs text-amber-700 font-medium">
+                            Viewing Flight {selectedFlightIndex} — all charts below show only this segment.
+                            <button
+                                type="button"
+                                onClick={() => setSelectedFlightIndex(null)}
+                                className="ml-2 underline hover:text-amber-900"
+                            >
+                                Clear filter
+                            </button>
+                        </p>
+                    )}
+                </section>
+            )}
+
+            {/* ── Phase Timeline Bar (Task 7) ──────────────────────────────────────── */}
+            {isLoadingPhases && (
+                <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+                    <div className="h-3.5 w-28 animate-pulse rounded bg-gray-200" />
+                    <div className="h-8 w-full animate-pulse rounded-lg bg-gray-100" />
+                </div>
+            )}
+            {!isLoadingPhases && (phaseError || (flightPhases && flightPhases.length === 0)) && (
+                <div className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-2 text-xs text-gray-500">
+                    Phase detection unavailable — insufficient vertical speed data
+                </div>
+            )}
+            {!isLoadingPhases && groupedPhases.length > 0 && (() => {
+                const totalDuration = groupedPhases.reduce((sum, p) => sum + p.duration_s, 0);
+                return (
+                    <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                                <h2 className="text-sm font-semibold text-gray-900">Flight Phases</h2>
+                                <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${phaseBadgeClass}`}>
+                                    {phaseBadgeLabel}
+                                </span>
+                            </div>
+                            {selectedPhaseKey && (
+                                <button
+                                    type="button"
+                                    onClick={() => setSelectedPhaseKey(null)}
+                                    className="text-xs text-gray-500 underline hover:text-gray-700"
+                                >
+                                    Clear phase filter
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Phase bar — max 5 solid blocks, 2 px gaps, 36 px tall */}
+                        {totalDuration > 0 && (
+                            <div className="flex h-9 w-full gap-0.5">
+                                {groupedPhases.map((p) => {
+                                    const widthPct = (p.duration_s / totalDuration) * 100;
+                                    const isActive = selectedPhaseKey === p.phase;
+                                    const isAnySelected = selectedPhaseKey !== null;
+                                    return (
+                                        <div
+                                            key={p.phase}
+                                            title={`${p.phase} — ${formatPhaseDuration(p.duration_s)}`}
+                                            onClick={() =>
+                                                setSelectedPhaseKey(isActive ? null : p.phase)
+                                            }
+                                            style={{
+                                                width: `${widthPct}%`,
+                                                backgroundColor: PHASE_COLORS[p.phase] || "#94a3b8",
+                                                opacity: isAnySelected
+                                                    ? isActive ? 1 : 0.35
+                                                    : 0.85,
+                                            }}
+                                            className="flex cursor-pointer flex-col items-center justify-center overflow-hidden rounded-md px-1 text-white transition-opacity hover:opacity-100 select-none"
+                                        >
+                                            {widthPct > 8 && (
+                                                <span className="truncate text-xs font-bold leading-tight">
+                                                    {widthPct > 14
+                                                        ? p.phase
+                                                        : p.phase.slice(0, 2)}
+                                                </span>
+                                            )}
+                                            {widthPct > 14 && (
+                                                <span className="truncate text-[10px] leading-tight opacity-90">
+                                                    {formatPhaseDuration(p.duration_s)}
+                                                </span>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+
+                        {/* Legend — click to filter, same as bar */}
+                        <div className="flex flex-wrap gap-4">
+                            {groupedPhases.map((p) => {
+                                const isActive = selectedPhaseKey === p.phase;
+                                return (
+                                    <button
+                                        key={p.phase}
+                                        type="button"
+                                        onClick={() =>
+                                            setSelectedPhaseKey(isActive ? null : p.phase)
+                                        }
+                                        className={`flex items-center gap-1.5 text-xs transition ${
+                                            isActive
+                                                ? "font-bold text-gray-900"
+                                                : "text-gray-500 hover:text-gray-800"
+                                        }`}
+                                    >
+                                        <span
+                                            className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-sm"
+                                            style={{ backgroundColor: PHASE_COLORS[p.phase] || "#94a3b8" }}
+                                        />
+                                        {p.phase}
+                                        <span className="text-gray-400">
+                                            ({formatPhaseDuration(p.duration_s)})
+                                        </span>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        {selectedPhaseKey && (
+                            <p className="text-xs font-medium" style={{ color: PHASE_COLORS[selectedPhaseKey] }}>
+                                Viewing {selectedPhaseKey} phase — all charts below show only this window.
+                            </p>
+                        )}
+                    </section>
+                );
+            })()}
+
+            {/* ── Occurrence info strip (Task 8) ────────────────────────────────── */}
+            {occurrenceWindow?.start != null && occurrenceWindow?.end != null ? (
+                <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm shadow-sm">
+                    <span className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full bg-amber-500" />
+                    <span className="font-semibold text-amber-900">Occurrence window</span>
+                    {occurrenceWindow.label && (
+                        <span className="rounded-full bg-amber-200 px-2 py-0.5 text-xs font-semibold text-amber-900">
+                            {occurrenceWindow.label}
+                        </span>
+                    )}
+                    <span className="text-amber-800">
+                        {formatSessionTime(occurrenceWindow.start)}
+                        {" → "}
+                        {formatSessionTime(occurrenceWindow.end)}
+                        {" "}
+                        <span className="text-amber-600">
+                            ({formatPhaseDuration(occurrenceWindow.end - occurrenceWindow.start)})
+                        </span>
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setOccurrenceWindow(null);
+                            saveFdrOccurrence(caseNumber, { start: null, end: null, label: null }).catch(() => {});
+                        }}
+                        className="ml-auto text-xs text-amber-700 underline hover:text-amber-900"
+                    >
+                        Clear
+                    </button>
+                </div>
+            ) : (
+                <p className="text-xs text-gray-400">
+                    Drag on any chart below to mark an occurrence window.
+                </p>
+            )}
+
+            {/* ── Parameter Correlation View (Task 12) ───────────────────────────── */}
+            {(() => {
+                // Build grouped selector options — only params present in availableParameters.
+                const configGroups = fdrParameterConfig
+                    .map((cat) => ({
+                        ...cat,
+                        available: cat.params.filter((p) => availableParameters.includes(p.id)),
+                    }))
+                    .filter((cat) => cat.available.length > 0);
+
+                const knownIds = new Set(fdrParameterConfig.flatMap((c) => c.params.map((p) => p.id)));
+                const otherParams = availableParameters.filter((p) => !knownIds.has(p));
+
+                const searchLower = correlationSearch.trim().toLowerCase();
+                const filterGroup = (params) =>
+                    searchLower
+                        ? params.filter(
+                              (p) =>
+                                  p.id.toLowerCase().includes(searchLower) ||
+                                  (p.label || "").toLowerCase().includes(searchLower)
+                          )
+                        : params;
+
+                const MAX_PARAMS = 8;
+                const atCap = correlationParams.length >= MAX_PARAMS;
+
+                const toggleParam = (id) => {
+                    setCorrelationParams((prev) => {
+                        if (prev.includes(id)) return prev.filter((x) => x !== id);
+                        if (prev.length >= MAX_PARAMS) return prev;
+                        return [...prev, id];
+                    });
+                };
+
+                return (
+                    <section className="rounded-xl border border-gray-200 bg-white shadow-sm">
+                        {/* Header */}
+                        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+                            <div>
+                                <h2 className="text-base font-semibold text-gray-900">
+                                    Parameter Correlation View
+                                </h2>
+                                <p className="text-xs text-gray-500 mt-0.5">
+                                    Compare up to {MAX_PARAMS} parameters on a shared timeline. Values are normalized per-parameter.
+                                </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {correlationParams.length > 0 && (
+                                    <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
+                                        {correlationParams.length} selected
+                                    </span>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={() => setCorrelationSelectorOpen((v) => !v)}
+                                    className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50 transition"
+                                >
+                                    {correlationSelectorOpen ? "Hide selector ▲" : "Edit selection ▼"}
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Collapsible selector */}
+                        {correlationSelectorOpen && (
+                            <div className="border-b border-gray-100 px-5 py-4 space-y-3">
+                                <input
+                                    type="text"
+                                    value={correlationSearch}
+                                    onChange={(e) => setCorrelationSearch(e.target.value)}
+                                    placeholder="Search parameters…"
+                                    className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-100"
+                                />
+                                {atCap && (
+                                    <p className="text-xs text-amber-700 font-medium">
+                                        Maximum {MAX_PARAMS} parameters selected. Deselect one to add another.
+                                    </p>
+                                )}
+                                <div className="space-y-3 max-h-56 overflow-y-auto pr-1">
+                                    {configGroups.map((cat) => {
+                                        const visible = filterGroup(cat.available);
+                                        if (visible.length === 0) return null;
+                                        return (
+                                            <div key={cat.key}>
+                                                <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-1.5">
+                                                    {cat.name}
+                                                </p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {visible.map((p) => {
+                                                        const checked = correlationParams.includes(p.id);
+                                                        const meta = parameterDisplayMap[p.id];
+                                                        const color = meta?.color ?? colorPalette[0];
+                                                        return (
+                                                            <button
+                                                                key={p.id}
+                                                                type="button"
+                                                                onClick={() => toggleParam(p.id)}
+                                                                disabled={!checked && atCap}
+                                                                className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition ${
+                                                                    checked
+                                                                        ? "border-transparent text-white"
+                                                                        : "border-gray-200 bg-white text-gray-600 hover:bg-gray-50"
+                                                                } ${!checked && atCap ? "opacity-40 cursor-not-allowed" : ""}`}
+                                                                style={checked ? { backgroundColor: color, borderColor: color } : {}}
+                                                            >
+                                                                {checked && (
+                                                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-white opacity-80" />
+                                                                )}
+                                                                {p.label || p.id}
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                    {otherParams.length > 0 && (() => {
+                                        const visible = filterGroup(
+                                            otherParams.map((id) => ({ id, label: id }))
+                                        );
+                                        if (visible.length === 0) return null;
+                                        return (
+                                            <div key="other">
+                                                <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-1.5">
+                                                    Other
+                                                </p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {visible.map((p) => {
+                                                        const checked = correlationParams.includes(p.id);
+                                                        const meta = parameterDisplayMap[p.id];
+                                                        const color = meta?.color ?? colorPalette[0];
+                                                        return (
+                                                            <button
+                                                                key={p.id}
+                                                                type="button"
+                                                                onClick={() => toggleParam(p.id)}
+                                                                disabled={!checked && atCap}
+                                                                className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition ${
+                                                                    checked
+                                                                        ? "border-transparent text-white"
+                                                                        : "border-gray-200 bg-white text-gray-600 hover:bg-gray-50"
+                                                                } ${!checked && atCap ? "opacity-40 cursor-not-allowed" : ""}`}
+                                                                style={checked ? { backgroundColor: color, borderColor: color } : {}}
+                                                            >
+                                                                {checked && (
+                                                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-white opacity-80" />
+                                                                )}
+                                                                {p.label || p.id}
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
+                                </div>
+                                {correlationParams.length > 0 && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setCorrelationParams([])}
+                                        className="text-xs text-gray-400 underline hover:text-gray-600"
+                                    >
+                                        Clear all
+                                    </button>
+                                )}
+                            </div>
+                        )}
+
+                        {/* Chart */}
+                        <div className="px-5 py-4">
+                            {correlationParams.length === 0 ? (
+                                <div className="flex h-48 items-center justify-center rounded-xl border border-dashed border-gray-200 bg-gray-50 text-sm text-gray-500">
+                                    Select at least one parameter above to view the correlation chart.
+                                </div>
+                            ) : correlationChartData.length === 0 ? (
+                                <div className="flex h-48 items-center justify-center rounded-xl border border-dashed border-gray-200 bg-gray-50 text-sm text-gray-500">
+                                    No data available for the selected parameters.
+                                </div>
+                            ) : (
+                                <div className="h-96">
+                                    <ResponsiveContainer width="100%" height="100%">
+                                        <ComposedChart
+                                            data={correlationChartData}
+                                            margin={{ top: 12, right: 24, left: 0, bottom: 24 }}
+                                            onMouseDown={handleChartMouseDown}
+                                            onMouseMove={handleChartMouseMove}
+                                        >
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#94a3b8"
+                                                minTickGap={20}
+                                                tickFormatter={formatFlightTime}
+                                                label={{
+                                                    value: timeAxisLabel,
+                                                    position: "insideBottom",
+                                                    offset: -12,
+                                                    fill: "#94a3b8",
+                                                    fontSize: 11,
+                                                }}
+                                            />
+                                            <YAxis
+                                                stroke="#94a3b8"
+                                                domain={[0, 1]}
+                                                tickFormatter={(v) => v.toFixed(1)}
+                                                label={{
+                                                    value: "Normalized (0–1)",
+                                                    angle: -90,
+                                                    position: "insideLeft",
+                                                    offset: 10,
+                                                    fill: "#94a3b8",
+                                                    fontSize: 10,
+                                                }}
+                                            />
+                                            <Tooltip
+                                                cursor={{ stroke: "#cbd5e1" }}
+                                                content={({ active, payload, label }) => {
+                                                    if (!active || !payload || payload.length === 0) return null;
+                                                    return (
+                                                        <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs shadow-lg">
+                                                            <p className="mb-1.5 font-semibold text-gray-600">
+                                                                {timeAxisLabel}: {formatFlightTime(label)}
+                                                            </p>
+                                                            {payload
+                                                                .filter((entry) => !String(entry.dataKey).endsWith("__raw"))
+                                                                .map((entry) => {
+                                                                    const rawVal = entry.payload?.[entry.dataKey + "__raw"];
+                                                                    const meta = parameterDisplayMap[entry.dataKey] || { label: entry.dataKey, unit: "" };
+                                                                    const displayVal =
+                                                                        typeof rawVal === "number"
+                                                                            ? `${rawVal.toFixed(2)}${meta.unit ? " " + meta.unit : ""}`
+                                                                            : "—";
+                                                                    return (
+                                                                        <div key={entry.dataKey} className="flex items-center gap-2 py-0.5">
+                                                                            <span
+                                                                                className="inline-block h-2 w-2 flex-shrink-0 rounded-full"
+                                                                                style={{ backgroundColor: entry.stroke }}
+                                                                            />
+                                                                            <span className="text-gray-700 font-medium">{meta.label || entry.dataKey}</span>
+                                                                            <span className="ml-auto pl-4 font-mono text-gray-900">{displayVal}</span>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                        </div>
+                                                    );
+                                                }}
+                                            />
+                                            <Legend
+                                                verticalAlign="bottom"
+                                                height={36}
+                                                formatter={(value) => {
+                                                    const meta = parameterDisplayMap[value];
+                                                    return meta?.label || value;
+                                                }}
+                                            />
+                                            {/* Phase bands */}
+                                            {groupedPhases.map((p) => (
+                                                <ReferenceArea
+                                                    key={p.phase}
+                                                    x1={p.start_time}
+                                                    x2={p.end_time}
+                                                    fill={PHASE_COLORS[p.phase] || "#94a3b8"}
+                                                    fillOpacity={
+                                                        p.phase === "TAKEOFF" || p.phase === "LANDING" ? 0.12 : 0.08
+                                                    }
+                                                    ifOverflow="hidden"
+                                                />
+                                            ))}
+                                            {/* Drag preview band */}
+                                            {isDragging && dragStartTime !== null && dragCurrentTime !== null && (
+                                                <ReferenceArea
+                                                    x1={Math.min(dragStartTime, dragCurrentTime)}
+                                                    x2={Math.max(dragStartTime, dragCurrentTime)}
+                                                    fill="#f59e0b"
+                                                    fillOpacity={0.10}
+                                                    stroke="#fbbf24"
+                                                    strokeDasharray="3 2"
+                                                    ifOverflow="hidden"
+                                                />
+                                            )}
+                                            {/* Saved occurrence band */}
+                                            {occurrenceWindow?.start != null && occurrenceWindow?.end != null && (
+                                                <ReferenceArea
+                                                    x1={occurrenceWindow.start}
+                                                    x2={occurrenceWindow.end}
+                                                    fill="#f59e0b"
+                                                    fillOpacity={0.22}
+                                                    stroke="#d97706"
+                                                    strokeWidth={1}
+                                                    ifOverflow="hidden"
+                                                />
+                                            )}
+                                            {occurrenceWindow?.start != null && occurrenceWindow?.end != null && (
+                                                <ReferenceLine
+                                                    x={(occurrenceWindow.start + occurrenceWindow.end) / 2}
+                                                    stroke="#92400e"
+                                                    strokeDasharray="4 3"
+                                                    strokeWidth={1.5}
+                                                    label={{
+                                                        value: occurrenceWindow.label
+                                                            ? `Occurrence · ${occurrenceWindow.label}`
+                                                            : "Occurrence",
+                                                        position: "insideTopRight",
+                                                        fill: "#92400e",
+                                                        fontSize: 10,
+                                                        fontWeight: 600,
+                                                    }}
+                                                />
+                                            )}
+                                            {/* One line per selected param */}
+                                            {correlationParams.map((p) => {
+                                                const meta = parameterDisplayMap[p] || { label: p, color: colorPalette[0] };
+                                                return (
+                                                    <Line
+                                                        key={p}
+                                                        type="monotone"
+                                                        dataKey={p}
+                                                        name={p}
+                                                        stroke={meta.color}
+                                                        strokeWidth={1.5}
+                                                        dot={false}
+                                                        connectNulls
+                                                        isAnimationActive={false}
+                                                    />
+                                                );
+                                            })}
+                                        </ComposedChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            )}
+                        </div>
+                    </section>
+                );
+            })()}
+
+            <section
+                ref={chartsRef}
+                className={`bg-white rounded-xl p-6 space-y-6 ${
+                    selectedPhaseKey
+                        ? "border-2"
+                        : selectedFlightIndex !== null
+                        ? "border-2 border-amber-400"
+                        : "border border-gray-200"
+                }`}
+                style={selectedPhaseKey ? { borderColor: PHASE_COLORS[selectedPhaseKey] } : {}}
+            >
                 <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                     <div>
                         <h2 className="text-lg font-semibold text-gray-900">
                             Flight Parameter Overview
+                            {selectedPhaseKey && (
+                                <span
+                                    className="ml-2 rounded-full px-2 py-0.5 text-xs font-semibold text-white"
+                                    style={{ backgroundColor: PHASE_COLORS[selectedPhaseKey] }}
+                                >
+                                    {selectedPhaseKey} phase
+                                </span>
+                            )}
+                            {!selectedPhaseKey && selectedFlightIndex !== null && (
+                                <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                                    Flight {selectedFlightIndex} only
+                                </span>
+                            )}
                         </h2>
                         <p className="text-sm text-gray-500">
                             Time series visualization of recorder values for each parameter.
@@ -3670,7 +5073,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         </p>
                     </div>
                     <span className="px-3 py-1 text-xs font-medium text-gray-500 bg-gray-100 rounded-full">
-                        {parameterTableRows.length} parameters
+                        {filteredParameterTableRows.length} parameters
                     </span>
                 </div>
 
@@ -3685,7 +5088,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-100">
-                            {parameterTableRows.map((row) => (
+                            {filteredParameterTableRows.map((row) => (
                                 <tr key={row.parameter} className="hover:bg-gray-50">
                                     <td className="px-4 py-3 font-medium text-gray-800">{row.parameter}</td>
                                     <td className="px-4 py-3 text-gray-500">{row.unit}</td>

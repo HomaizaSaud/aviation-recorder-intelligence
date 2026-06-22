@@ -819,6 +819,43 @@ const updateCaseCvrPipeline = async (caseNumber, pipeline, options = {}) => {
   );
 };
 
+const getFdrOccurrence = async (caseNumber) => {
+  const { rows } = await pool.query(
+    `SELECT analyses->'fdr'->'occurrenceWindow' AS window FROM cases WHERE case_number = $1`,
+    [caseNumber],
+  );
+  if (!rows[0]) return null;
+  const w = rows[0].window;
+  return {
+    start: w?.start ?? null,
+    end: w?.end ?? null,
+    label: w?.label ?? null,
+  };
+};
+
+const setFdrOccurrence = async (caseNumber, { start, end, label }) => {
+  const windowJson = JSON.stringify({
+    start: start ?? null,
+    end: end ?? null,
+    label: label ?? null,
+  });
+  const { rows } = await pool.query(
+    `UPDATE cases
+     SET analyses = jsonb_set(analyses, '{fdr,occurrenceWindow}', $1::jsonb, true),
+         updated_at = NOW()
+     WHERE case_number = $2
+     RETURNING analyses->'fdr'->'occurrenceWindow' AS window`,
+    [windowJson, caseNumber],
+  );
+  if (!rows[0]) return null;
+  const w = rows[0].window;
+  return {
+    start: w?.start ?? null,
+    end: w?.end ?? null,
+    label: w?.label ?? null,
+  };
+};
+
 module.exports = {
   listCases,
   findCaseByNumber,
@@ -829,4 +866,6 @@ module.exports = {
   updateCaseFdrAnalysis,
   updateCaseFdrAnalysisStatus,
   updateCaseCvrPipeline,
+  getFdrOccurrence,
+  setFdrOccurrence,
 };

@@ -13,20 +13,28 @@ from sklearn.decomposition import PCA
 DEFAULT_WINDOW_SIZE = int(os.getenv("FDR_WINDOW_SIZE", "60"))
 DEFAULT_STRIDE = int(os.getenv("FDR_WINDOW_STRIDE", "5"))
 DEFAULT_EPOCHS = int(os.getenv("FDR_EPOCHS", "30"))
-DEFAULT_THRESHOLD_PERCENTILE = float(os.getenv("FDR_THRESHOLD_PERCENTILE", "97"))
+DEFAULT_THRESHOLD_PERCENTILE = float(os.getenv("FDR_THRESHOLD_PERCENTILE", "85"))
 DEFAULT_BATCH_SIZE = int(os.getenv("FDR_BATCH_SIZE", "128"))
 DEFAULT_BACKEND = os.getenv("FDR_AUTOENCODER_BACKEND", "pca").strip().lower()
 MIN_TRAIN_STD = float(os.getenv("FDR_MIN_TRAIN_STD", "1e-3"))
 MAX_STANDARDIZED_ABS = float(os.getenv("FDR_MAX_STANDARDIZED_ABS", "20"))
-SEGMENT_GAP_SECONDS = 2.0
+SEGMENT_GAP_SECONDS = 30.0  # merge anomalous rows within 30 s into one segment
 
-TIME_COLUMNS = {"Session Time", "System Time", "GPS Date & Time"}
+TIME_COLUMNS = {
+    "Session Time", "System Time", "GPS Date & Time",
+    # NASA DFDAU time columns
+    "GMT_HOUR", "GMT_MINUTE", "GMT_MIN", "GMT_SEC",
+}
 EXCLUDED_COLUMNS = {
     "Session Time",
     "System Time",
     "GPS Date & Time",
     "Destination Waypoint ID",
     "Transponder Code (octal)",
+    # NASA DFDAU time components (synthesised into "Session Time" by fdr_format)
+    "GMT_HOUR", "GMT_MINUTE", "GMT_MIN", "GMT_SEC",
+    # mat_to_excel row counter
+    "Sample #",
 }
 EXCLUDED_COLUMN_TOKENS = (
     "waypoint",
@@ -38,6 +46,7 @@ EXCLUDED_COLUMN_TOKENS = (
     "label",
     "id",
     "name",
+    "sample",   # catches "Sample #" row-counter columns
 )
 MIN_NUMERIC_FEATURES = 2
 
@@ -306,7 +315,7 @@ def _group_segments(
         return {
             "start_time": float(timestamps[segment_indices[0]]),
             "end_time": float(timestamps[segment_indices[-1]]),
-            "severity": _score_to_severity(seg_scores.max(), scores, threshold),
+            "severity": _score_to_severity(seg_scores.max(), scores),
             "score_peak": float(seg_scores.max()),
             "top_drivers": top_drivers,
             "explanation": explanation,
@@ -349,13 +358,17 @@ def _build_explanation(top_drivers: List[Dict[str, object]]) -> str:
     return "Unusual behavior pattern compared to learned normal behavior for this flight."
 
 
-def _score_to_severity(score: float, scores: np.ndarray, high_threshold: float) -> str:
+def _score_to_severity(score: float, scores: np.ndarray) -> str:
+    # Severity is relative to the full flight score distribution, not the inclusion
+    # threshold — otherwise every included segment would be "high" since the old
+    # inclusion threshold equalled the high threshold (both were at the 97th percentile).
     if np.allclose(scores, scores[0]):
         return "low"
-    medium_threshold = np.percentile(scores, 90)
-    if score >= high_threshold:
+    p97 = float(np.percentile(scores, 97))
+    p90 = float(np.percentile(scores, 90))
+    if score >= p97:
         return "high"
-    if score >= medium_threshold:
+    if score >= p90:
         return "med"
     return "low"
 
@@ -413,9 +426,10 @@ def detect_anomalies(
     batch_size: int = DEFAULT_BATCH_SIZE,
     debug: bool = False,
 ) -> Dict[str, object]:
+    from services.fdr_anomaly.fdr_format import normalize_dataframe  # noqa: PLC0415
+
     df = _load_data(path)
-    if "Session Time" not in df.columns:
-        raise ValueError("Input file must include a 'Session Time' column.")
+    df, _fmt = normalize_dataframe(df)
 
     timestamps = _parse_session_time(df["Session Time"])
     order = np.argsort(timestamps)
@@ -498,6 +512,17 @@ def detect_anomalies(
     )
 
     threshold = np.percentile(timeline_scores, threshold_percentile) if n_rows > 0 else 0.0
+
+    logger.info(
+        "FDR score stats: n_rows=%d n_windows=%d "
+        "score_min=%.6g score_max=%.6g score_mean=%.6g score_median=%.6g "
+        "threshold_pct=%g threshold=%.6g",
+        n_rows, len(starts),
+        float(np.min(timeline_scores)), float(np.max(timeline_scores)),
+        float(np.mean(timeline_scores)), float(np.median(timeline_scores)),
+        threshold_percentile, float(threshold),
+    )
+
     segments = _group_segments(
         timestamps, timeline_scores, timeline_feature_scores, feature_names, threshold
     )
@@ -506,6 +531,29 @@ def detect_anomalies(
         segments = _build_review_segments(
             timestamps, timeline_scores, timeline_feature_scores, feature_names
         )
+
+    # Normalize score_peak relative to the detection threshold so values are
+    # human-readable (1.0 = at threshold; 2.0 = twice the threshold).
+    # Raw reconstruction errors from PCA are typically in the 1e-4 – 1e-2 range
+    # and show as "0.00" with two decimal places without this normalisation.
+    if threshold > 0:
+        for seg in segments:
+            raw = seg.get("score_peak", 0.0)
+            seg["score_peak"] = round(float(raw) / float(threshold), 4)
+    else:
+        # threshold = 0 means all scores are identical; leave score_peak as-is
+        pass
+
+    # Sort by severity then peak score; cap at 10 for UI clarity
+    _SEVERITY_ORDER = {"high": 3, "med": 2, "low": 1}
+    segments = sorted(
+        segments,
+        key=lambda s: (_SEVERITY_ORDER.get(s.get("severity", "low"), 0), s.get("score_peak", 0)),
+        reverse=True,
+    )
+    _MAX_SEGMENTS = 10
+    extra_segments_omitted = max(0, len(segments) - _MAX_SEGMENTS)
+    segments = segments[:_MAX_SEGMENTS]
 
     driver_counts: Dict[str, int] = {}
     for segment in segments:
@@ -583,6 +631,7 @@ def detect_anomalies(
         "n_rows": int(n_rows),
         "n_params_used": int(len(feature_names)),
         "segments_found": int(len(segments)),
+        "extra_segments_omitted": int(extra_segments_omitted),
         "top_parameters": top_parameters,
         "flaggedRowCount": flagged_row_count,
         "flaggedPercent": round(flagged_percent, 4),
