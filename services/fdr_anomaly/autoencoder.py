@@ -19,6 +19,9 @@ DEFAULT_BACKEND = os.getenv("FDR_AUTOENCODER_BACKEND", "pca").strip().lower()
 MIN_TRAIN_STD = float(os.getenv("FDR_MIN_TRAIN_STD", "1e-3"))
 MAX_STANDARDIZED_ABS = float(os.getenv("FDR_MAX_STANDARDIZED_ABS", "20"))
 SEGMENT_GAP_SECONDS = 30.0  # merge anomalous rows within 30 s into one segment
+# Phases with fewer rows than this use the global threshold (not a per-phase one)
+# to avoid false positives from tiny sample sizes.
+MIN_PHASE_ROWS_FOR_THRESHOLD = 30
 
 TIME_COLUMNS = {
     "Session Time", "System Time", "GPS Date & Time",
@@ -293,8 +296,11 @@ def _group_segments(
     feature_scores: np.ndarray,
     feature_names: List[str],
     threshold: float,
+    anomaly_mask_override: "np.ndarray | None" = None,
 ) -> List[Dict[str, object]]:
-    if np.allclose(scores, scores[0]):
+    if anomaly_mask_override is not None:
+        anomaly_mask = anomaly_mask_override
+    elif np.allclose(scores, scores[0]):
         anomaly_mask = np.zeros_like(scores, dtype=bool)
     else:
         anomaly_mask = scores >= threshold
@@ -358,19 +364,51 @@ def _build_explanation(top_drivers: List[Dict[str, object]]) -> str:
     return "Unusual behavior pattern compared to learned normal behavior for this flight."
 
 
-def _score_to_severity(score: float, scores: np.ndarray) -> str:
-    # Severity is relative to the full flight score distribution, not the inclusion
-    # threshold — otherwise every included segment would be "high" since the old
-    # inclusion threshold equalled the high threshold (both were at the 97th percentile).
-    if np.allclose(scores, scores[0]):
+def _score_to_severity(
+    score: float,
+    scores: np.ndarray,
+    phase_scores: "np.ndarray | None" = None,
+) -> str:
+    # Rate severity against the phase's own score distribution when available,
+    # otherwise fall back to the flight-wide distribution.
+    ref = phase_scores if (phase_scores is not None and len(phase_scores) > 1) else scores
+    if np.allclose(ref, ref[0]):
         return "low"
-    p97 = float(np.percentile(scores, 97))
-    p90 = float(np.percentile(scores, 90))
+    p97 = float(np.percentile(ref, 97))
+    p90 = float(np.percentile(ref, 90))
     if score >= p97:
         return "high"
     if score >= p90:
         return "med"
     return "low"
+
+
+def _get_phase_labels(df: "pd.DataFrame", timestamps: np.ndarray) -> np.ndarray:
+    """Label every row with its flight phase by reusing phase.py logic.
+
+    Returns an object array of phase strings with len == len(timestamps).
+    Falls back to all-CRUISE on any error (preserves old global behaviour).
+    """
+    try:
+        from services.fdr_anomaly.phase import (  # noqa: PLC0415
+            _find_col,
+            _label_phases,
+            _to_numeric,
+            ALT_CANDIDATES,
+            IAS_CANDIDATES,
+            VS_CANDIDATES,
+        )
+
+        vs_col = _find_col(df, VS_CANDIDATES)
+        ias_col = _find_col(df, IAS_CANDIDATES)
+        alt_col = _find_col(df, ALT_CANDIDATES)
+        vs_arr = _to_numeric(df[vs_col]) if vs_col else None
+        ias_arr = _to_numeric(df[ias_col]) if ias_col else None
+        alt_arr = _to_numeric(df[alt_col]) if alt_col else None
+        return _label_phases(timestamps, vs_arr, ias_arr, alt_arr)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Phase labeling failed, using global baseline: %s", exc)
+        return np.full(len(timestamps), "CRUISE", dtype=object)
 
 
 def _extract_unit(parameter: str) -> str:
@@ -435,6 +473,10 @@ def detect_anomalies(
     order = np.argsort(timestamps)
     df = df.iloc[order].reset_index(drop=True)
     timestamps = timestamps[order]
+
+    # Task 9 — label each row with its flight phase BEFORE numeric selection so
+    # that VS / altitude columns are still present.
+    phase_labels = _get_phase_labels(df, timestamps)
 
     numeric_df, feature_names, dropped_columns = _select_numeric_columns(df)
     if dropped_columns:
@@ -511,6 +553,7 @@ def detect_anomalies(
         n_rows, window_size, starts, window_errors, window_feature_errors
     )
 
+    # ── Global threshold (used as fallback for small phases) ─────────────────────
     threshold = np.percentile(timeline_scores, threshold_percentile) if n_rows > 0 else 0.0
 
     logger.info(
@@ -523,8 +566,49 @@ def detect_anomalies(
         threshold_percentile, float(threshold),
     )
 
+    # ── Task 9 — Per-phase thresholding ──────────────────────────────────────────
+    # Each phase gets its own threshold at the same percentile of that phase's
+    # score distribution.  Phases with fewer than MIN_PHASE_ROWS_FOR_THRESHOLD
+    # rows fall back to the global threshold to avoid false positives from tiny
+    # samples (e.g. TAKEOFF / LANDING often have < 30 rows).
+    unique_phases = sorted(set(phase_labels))
+    phase_thresholds: Dict[str, float] = {}
+    phase_scores_map: Dict[str, np.ndarray] = {}   # phase → scores array (for severity)
+    phase_used_global_fallback: set = set()
+
+    for ph in unique_phases:
+        ph_mask = phase_labels == ph
+        ph_scores = timeline_scores[ph_mask]
+        phase_scores_map[ph] = ph_scores
+        if ph_mask.sum() < MIN_PHASE_ROWS_FOR_THRESHOLD:
+            phase_thresholds[ph] = float(threshold)
+            phase_used_global_fallback.add(ph)
+            logger.info(
+                "Phase %s has only %d rows — using global threshold (%.6g)",
+                ph, int(ph_mask.sum()), threshold,
+            )
+        else:
+            phase_thresholds[ph] = float(np.percentile(ph_scores, threshold_percentile))
+            logger.info(
+                "Phase %s: %d rows, per-phase threshold=%.6g",
+                ph, int(ph_mask.sum()), phase_thresholds[ph],
+            )
+
+    # Build a per-row threshold array then construct the anomaly mask.
+    phase_threshold_per_row = np.array(
+        [phase_thresholds.get(ph, threshold) for ph in phase_labels],
+        dtype=float,
+    )
+    if np.allclose(timeline_scores, timeline_scores[0]):
+        per_phase_anomaly_mask = np.zeros(n_rows, dtype=bool)
+    else:
+        per_phase_anomaly_mask = timeline_scores >= phase_threshold_per_row
+
+    # ─────────────────────────────────────────────────────────────────────────────
+
     segments = _group_segments(
-        timestamps, timeline_scores, timeline_feature_scores, feature_names, threshold
+        timestamps, timeline_scores, timeline_feature_scores, feature_names,
+        threshold, anomaly_mask_override=per_phase_anomaly_mask,
     )
 
     if not segments:
@@ -532,17 +616,38 @@ def detect_anomalies(
             timestamps, timeline_scores, timeline_feature_scores, feature_names
         )
 
-    # Normalize score_peak relative to the detection threshold so values are
-    # human-readable (1.0 = at threshold; 2.0 = twice the threshold).
-    # Raw reconstruction errors from PCA are typically in the 1e-4 – 1e-2 range
-    # and show as "0.00" with two decimal places without this normalisation.
+    # ── Task 9 — annotate each segment with its dominant phase ────────────────
+    def _segment_phase(seg: Dict[str, object]) -> str:
+        start_t = seg.get("start_time")
+        end_t = seg.get("end_time")
+        if start_t is None:
+            return "CRUISE"
+        mid_t = ((start_t or 0) + (end_t or start_t or 0)) / 2
+        idx = int(np.argmin(np.abs(timestamps - mid_t)))
+        return str(phase_labels[idx]) if idx < len(phase_labels) else "CRUISE"
+
+    for seg in segments:
+        seg_phase = _segment_phase(seg)
+        seg["phase_label"] = seg_phase
+        seg["baseline_method"] = (
+            "global_fallback_insufficient_data"
+            if seg_phase in phase_used_global_fallback
+            else "per_phase_threshold"
+        )
+        # Re-score severity against the phase-specific distribution.
+        ph_scores_ref = phase_scores_map.get(seg_phase)
+        if ph_scores_ref is not None and len(ph_scores_ref) > 1:
+            peak_raw = seg.get("score_peak", 0.0)
+            seg["severity"] = _score_to_severity(
+                float(peak_raw), timeline_scores, phase_scores=ph_scores_ref
+            )
+
+    # ── Normalize score_peak relative to the *global* threshold so values remain
+    # comparable across runs (1.0 = at global threshold; 2.0 = twice).
     if threshold > 0:
         for seg in segments:
             raw = seg.get("score_peak", 0.0)
             seg["score_peak"] = round(float(raw) / float(threshold), 4)
-    else:
-        # threshold = 0 means all scores are identical; leave score_peak as-is
-        pass
 
     # Sort by severity then peak score; cap at 10 for UI clarity
     _SEVERITY_ORDER = {"high": 3, "med": 2, "low": 1}
@@ -568,11 +673,8 @@ def detect_anomalies(
         for name, count in sorted(driver_counts.items(), key=lambda item: item[1], reverse=True)
     ]
 
-    if np.allclose(timeline_scores, timeline_scores[0]):
-        flagged_mask = np.zeros_like(timeline_scores, dtype=bool)
-    else:
-        flagged_mask = timeline_scores >= threshold
-
+    # ── Build flagged_mask for baseline stats (union of per-phase mask + segments) ──
+    flagged_mask = per_phase_anomaly_mask.copy()
     for segment in segments:
         start_time = segment.get("start_time")
         end_time = segment.get("end_time")
@@ -580,27 +682,40 @@ def detect_anomalies(
             continue
         flagged_mask |= (timestamps >= start_time) & (timestamps <= end_time)
 
-    baseline_mask = ~flagged_mask
-    baseline_df = numeric_df[baseline_mask]
-    if baseline_df.empty:
-        baseline_df = numeric_df
+    # ── Task 9 — per-phase baseline stats for driver_stats ───────────────────
+    # Non-flagged rows within the same phase give the phase-local baseline;
+    # fall back to all phase rows if everything in the phase is flagged.
+    def _phase_baseline_stats(ph: str) -> Dict[str, Dict[str, float]]:
+        ph_mask = phase_labels == ph
+        nf_mask = ph_mask & ~flagged_mask
+        ref_df = numeric_df[nf_mask] if not numeric_df[nf_mask].empty else numeric_df[ph_mask]
+        if ref_df.empty:
+            ref_df = numeric_df
+        stats: Dict[str, Dict[str, float]] = {}
+        for col in feature_names:
+            vals = ref_df[col].to_numpy(dtype=float)
+            if vals.size == 0:
+                continue
+            stats[col] = {
+                "baseline_p5": float(np.percentile(vals, 5)),
+                "baseline_p95": float(np.percentile(vals, 95)),
+                "baseline_median": float(np.median(vals)),
+            }
+        return stats
 
-    baseline_stats: Dict[str, Dict[str, float]] = {}
-    for name in feature_names:
-        values = baseline_df[name].to_numpy(dtype=float)
-        if values.size == 0:
-            continue
-        baseline_stats[name] = {
-            "baseline_p5": float(np.percentile(values, 5)),
-            "baseline_p95": float(np.percentile(values, 95)),
-            "baseline_median": float(np.median(values)),
-        }
+    # Cache per-phase baselines (only compute for phases that appear in segments).
+    phase_baseline_cache: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     for segment in segments:
         start_time = segment.get("start_time")
         end_time = segment.get("end_time")
         if start_time is None or end_time is None:
             continue
+        seg_phase = segment.get("phase_label", "CRUISE")
+        if seg_phase not in phase_baseline_cache:
+            phase_baseline_cache[seg_phase] = _phase_baseline_stats(seg_phase)
+        baseline_stats = phase_baseline_cache[seg_phase]
+
         segment_mask = (timestamps >= start_time) & (timestamps <= end_time)
         driver_stats = []
         for driver in segment.get("top_drivers", []):
@@ -627,6 +742,34 @@ def detect_anomalies(
     flagged_row_count = int(flagged_mask.sum())
     flagged_percent = (flagged_row_count / n_rows) * 100 if n_rows else 0.0
 
+    # ── Task 9 — phase_breakdown for UI Phase Breakdown section ──────────────
+    _SEV_RANK = {"high": 3, "med": 2, "low": 1}
+    phase_breakdown: Dict[str, Dict[str, object]] = {}
+    for ph in unique_phases:
+        ph_mask = phase_labels == ph
+        ph_segs = [s for s in segments if s.get("phase_label") == ph]
+        worst_sev = None
+        top_param = None
+        if ph_segs:
+            worst_seg = max(ph_segs, key=lambda s: _SEV_RANK.get(s.get("severity", "low"), 0))
+            worst_sev = worst_seg.get("severity")
+            dc: Dict[str, int] = {}
+            for s in ph_segs:
+                for d in s.get("top_drivers", []):
+                    n = d.get("parameter")
+                    if n:
+                        dc[n] = dc.get(n, 0) + 1
+            if dc:
+                top_param = max(dc, key=dc.get)  # type: ignore[arg-type]
+        phase_breakdown[ph] = {
+            "n_rows": int(ph_mask.sum()),
+            "segments_found": int(len(ph_segs)),
+            "worst_severity": worst_sev,
+            "top_param": top_param,
+            "threshold": float(phase_thresholds.get(ph, threshold)),
+            "used_global_fallback": ph in phase_used_global_fallback,
+        }
+
     summary = {
         "n_rows": int(n_rows),
         "n_params_used": int(len(feature_names)),
@@ -639,6 +782,8 @@ def detect_anomalies(
         "stride": int(stride),
         "threshold_percentile": float(threshold_percentile),
         "threshold_value": float(threshold),
+        "phase_breakdown": phase_breakdown,
+        "phase_aware": True,
     }
 
     timeline = TimelineData(

@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ChevronRight } from "lucide-react";
+import 'leaflet/dist/leaflet.css';
+import { MapContainer, TileLayer, Polyline, CircleMarker } from 'react-leaflet';
 import {
     ResponsiveContainer,
     ComposedChart,
@@ -153,6 +155,62 @@ const parameterGroupDefinitions = [
         title: "Other / GP Inputs",
         keywords: ["gp input"],
         fallback: true,
+    },
+];
+
+// Task 14 — keyword→parameter hint map for case description analysis.
+// keywords: stem/partial strings matched anywhere in the description (e.g. "land" matches
+// "landing", "landed"). paramKeywords: substrings matched against available parameter IDs/labels.
+const DESCRIPTION_KEYWORD_PARAM_MAP = [
+    {
+        label: "Landing / Approach",
+        keywords: ["land", "approach", "touch", "final", "flare", "glide"],
+        paramKeywords: ["pitch", "roll", "ias", "indicated airspeed", "vertical speed", "gps alt", "glideslope", "glide slope"],
+    },
+    {
+        label: "Engine / Power",
+        keywords: ["engine", "power", "rpm", "throttle", "torque", "cylinder", "magneto"],
+        paramKeywords: ["rpm", "manifold", "egt", "cht", "oil", "fuel flow", "torque"],
+    },
+    {
+        label: "Turbulence / Weather",
+        keywords: ["turbulence", "weather", "wind", "storm", "gust", "icing", "convect"],
+        paramKeywords: ["vert accel", "vertical accel", "lat accel", "lateral accel", "wind speed", "wind dir", "oat", "outside air"],
+    },
+    {
+        label: "Stall / Attitude",
+        keywords: ["stall", "attitude", "nose up", "nose down", "pitch up", "pitch down", "aoa"],
+        paramKeywords: ["aoa", "angle of attack", "pitch", "airspeed", "stall"],
+    },
+    {
+        label: "Navigation / GPS",
+        keywords: ["navig", "course", "deviat", "off course", "gps", "posit", "track", "bearing"],
+        paramKeywords: ["cdi", "course", "heading", "gps fix", "cross track", "xtk", "latitude", "longitude", "ground track"],
+    },
+    {
+        label: "Autopilot",
+        keywords: ["autopilot", " ap "],
+        paramKeywords: ["ap ", "autopilot"],
+    },
+    {
+        label: "Tail / Pressure / Structural",
+        keywords: ["tail", "press", "struct", "baro", "altim", "density"],
+        paramKeywords: ["pitch", "roll", "vert accel", "vertical accel", "lat accel", "lateral accel", "baro", "barometr", "density alt", "pressure alt"],
+    },
+    {
+        label: "Fuel",
+        keywords: ["fuel", "tank", "reserve", "endurance"],
+        paramKeywords: ["fuel remain", "fuel qty", "fuel flow", "fuel"],
+    },
+    {
+        label: "Speed",
+        keywords: ["overspeed", "underspeed", "vne", "vmo", "speed exceedance"],
+        paramKeywords: ["indicated airspeed", "true airspeed", "ground speed", "ias", "tas"],
+    },
+    {
+        label: "Vibration",
+        keywords: ["vibrat", "shake", "shudder", "buffet", "roughness"],
+        paramKeywords: ["vert accel", "vertical accel", "lat accel", "lateral accel"],
     },
 ];
 
@@ -990,6 +1048,10 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [correlationParams, setCorrelationParams] = useState([]);
     const [correlationSearch, setCorrelationSearch] = useState("");
     const [correlationSelectorOpen, setCorrelationSelectorOpen] = useState(true);
+    const [suggestionDismissed, setSuggestionDismissed] = useState(false);
+    const [whyExpanded, setWhyExpanded] = useState(false);
+    const [mapTrackOpen, setMapTrackOpen] = useState(false);
+    const [mapScrubTime, setMapScrubTime] = useState(null);
     const [isLoadingFdrData, setIsLoadingFdrData] = useState(false);
     const [fdrDataError, setFdrDataError] = useState("");
     const [caseSummaryCopied, setCaseSummaryCopied] = useState(false);
@@ -2546,10 +2608,78 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         }, 300);
     }, [workflowStage]);
 
-    // Default correlation param selection: pick the first present of the priority 4.
-    // Only runs when availableParameters loads; doesn't clobber user changes.
+    // Task 14 — derive suggested correlation params from the case description/summary.
+    // Returns null when no description text is available (no feedback shown).
+    // Returns { matched: false } when text is present but no keywords match (gray line shown).
+    // Returns { matched: true, params, matchedKeywords } when suggestions are found (blue banner).
+    const suggestedCorrelationParams = useMemo(() => {
+        // Scan every human-readable text field on the case — the description is often
+        // in caseName (the case title), summary, or notes rather than a dedicated field.
+        const src = selectedCase?.source || {};
+        const rawText = [
+            src.caseName,
+            src.summary,
+            src.description,
+            src.notes,
+            src.narrative,
+            src.location,
+        ].filter(Boolean).join(' ').trim();
+
+        console.debug("[FDR Task14] Case source keys:", Object.keys(src));
+        console.debug("[FDR Task14] Scanning text:", rawText || "(empty)");
+
+        if (!rawText || !availableParameters?.length) return null;
+
+        const text = rawText.toLowerCase();
+
+        const matchedGroups = DESCRIPTION_KEYWORD_PARAM_MAP.filter((group) =>
+            group.keywords.some((kw) => text.includes(kw))
+        );
+        console.debug("[FDR Task14] Matched groups:", matchedGroups.map((g) => g.label));
+
+        if (matchedGroups.length === 0) {
+            return { matched: false, params: [], matchedKeywords: [] };
+        }
+
+        const paramSet = new Set();
+        matchedGroups.forEach((group) => {
+            group.paramKeywords.forEach((pkw) => {
+                availableParameters.forEach((param) => {
+                    const labelLower = (parameterDisplayMap[param]?.label || param).toLowerCase();
+                    if (param.toLowerCase().includes(pkw) || labelLower.includes(pkw)) {
+                        paramSet.add(param);
+                    }
+                });
+            });
+        });
+
+        const params = Array.from(paramSet).slice(0, 6);
+        console.debug("[FDR Task14] Suggested params:", params);
+
+        if (params.length === 0) {
+            return { matched: false, params: [], matchedKeywords: matchedGroups.map((g) => g.label) };
+        }
+
+        return { matched: true, params, matchedKeywords: matchedGroups.map((g) => g.label) };
+    }, [selectedCase, availableParameters, parameterDisplayMap]);
+
+    // Reset suggestion dismissal when case changes.
+    useEffect(() => {
+        setSuggestionDismissed(false);
+        setWhyExpanded(false);
+    }, [caseNumber]);
+
+    // Default correlation param selection: prefer keyword-derived suggestions, then
+    // fall back to the priority 4. Only runs when availableParameters loads; doesn't
+    // clobber user changes.
     useEffect(() => {
         if (!availableParameters || availableParameters.length === 0) return;
+        if (suggestedCorrelationParams?.matched && suggestedCorrelationParams.params.length > 0) {
+            setCorrelationParams((prev) =>
+                prev.length === 0 ? suggestedCorrelationParams.params : prev
+            );
+            return;
+        }
         const PRIORITY = [
             "Indicated Airspeed (knots)",
             "Vertical Speed (ft/min)",
@@ -2558,7 +2688,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         ];
         const defaults = PRIORITY.filter((p) => availableParameters.includes(p));
         setCorrelationParams((prev) => (prev.length === 0 ? defaults : prev));
-    }, [availableParameters]);
+    }, [availableParameters, suggestedCorrelationParams]);
 
     const caseSummary = useMemo(() => {
         if (!anomalyResult) {
@@ -2641,6 +2771,87 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         resolveSegmentInterpretation,
         segments.length,
     ]);
+
+    // ── Task 13 — Flight Track Map ───────────────────────────────────────────────
+    // Detect which available parameters carry latitude and longitude values.
+    const latParam = useMemo(
+        () => availableParameters.find((p) => p.toLowerCase().includes("lat")),
+        [availableParameters]
+    );
+    const lonParam = useMemo(
+        () => availableParameters.find(
+            (p) => p.toLowerCase().includes("lon") || p.toLowerCase().includes("lng")
+        ),
+        [availableParameters]
+    );
+
+    // Build position points from filteredRows — skip zeros/nulls.
+    const mapTrackPoints = useMemo(() => {
+        if (!latParam || !lonParam) return [];
+        return filteredRows
+            .filter(
+                (r) =>
+                    typeof r[latParam] === "number" &&
+                    typeof r[lonParam] === "number" &&
+                    Math.abs(r[latParam]) > 0.001 &&
+                    Math.abs(r[lonParam]) > 0.001
+            )
+            .map((r) => ({
+                lat: r[latParam],
+                lon: r[lonParam],
+                time: r.time,
+                phase:
+                    flightPhases?.find(
+                        (p) =>
+                            typeof r.time === "number" &&
+                            r.time >= p.start_time &&
+                            r.time <= p.end_time
+                    )?.phase ?? "CRUISE",
+            }));
+    }, [filteredRows, latParam, lonParam, flightPhases]);
+
+    // Split track into runs of consecutive same-phase points (overlapping by 1 for seamless joins).
+    const mapPhasePolylines = useMemo(() => {
+        if (mapTrackPoints.length === 0) return [];
+        const segs = [];
+        let cur = { phase: mapTrackPoints[0].phase, points: [[mapTrackPoints[0].lat, mapTrackPoints[0].lon]] };
+        for (let i = 1; i < mapTrackPoints.length; i++) {
+            const pt = mapTrackPoints[i];
+            if (pt.phase === cur.phase) {
+                cur.points.push([pt.lat, pt.lon]);
+            } else {
+                cur.points.push([pt.lat, pt.lon]); // overlap for continuity
+                segs.push(cur);
+                cur = { phase: pt.phase, points: [[pt.lat, pt.lon]] };
+            }
+        }
+        segs.push(cur);
+        return segs;
+    }, [mapTrackPoints]);
+
+    // Lat/lon bounding box for initial map fit.
+    const mapBounds = useMemo(() => {
+        if (mapTrackPoints.length === 0) return null;
+        const lats = mapTrackPoints.map((p) => p.lat);
+        const lons = mapTrackPoints.map((p) => p.lon);
+        return [
+            [Math.min(...lats), Math.min(...lons)],
+            [Math.max(...lats), Math.max(...lons)],
+        ];
+    }, [mapTrackPoints]);
+
+    // Nearest track point to the scrubber time.
+    const mapScrubPosition = useMemo(() => {
+        if (mapScrubTime === null || mapTrackPoints.length === 0) return null;
+        let best = mapTrackPoints[0];
+        let bestDist = Math.abs(mapTrackPoints[0].time - mapScrubTime);
+        for (const pt of mapTrackPoints) {
+            const d = Math.abs(pt.time - mapScrubTime);
+            if (d < bestDist) { bestDist = d; best = pt; }
+        }
+        return best;
+    }, [mapScrubTime, mapTrackPoints]);
+    // ── End Task 13 ─────────────────────────────────────────────────────────────
 
     const handleCopyCaseSummary = async () => {
         if (!caseSummary?.copyText) {
@@ -3618,6 +3829,121 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         reflect stronger deviation from learned normal behavior (not probability).
                     </p>
                 </section>
+
+                {/* ── Task 9 — Phase Breakdown ─────────────────────────────────────── */}
+                {anomalyResult?.summary?.phase_breakdown && (() => {
+                    const pb = anomalyResult.summary.phase_breakdown;
+                    const phaseOrder = ["TAKEOFF", "CLIMB", "CRUISE", "DESCENT", "LANDING"];
+                    const rows = phaseOrder
+                        .filter((ph) => pb[ph])
+                        .map((ph) => ({ ph, ...pb[ph] }));
+                    if (rows.length === 0) return null;
+
+                    const SEV_COLOR = {
+                        high: "#ef4444",
+                        med: "#f59e0b",
+                        low: "#60a5fa",
+                    };
+                    const maxSegs = Math.max(...rows.map((r) => r.segments_found || 0), 1);
+
+                    return (
+                        <section className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm space-y-4">
+                            <div>
+                                <h2 className="text-base font-semibold text-gray-900">
+                                    Phase Breakdown
+                                </h2>
+                                <p className="text-xs text-gray-500 mt-0.5">
+                                    Anomaly segments distributed across flight phases — each phase scored against its own baseline.
+                                </p>
+                            </div>
+
+                            {/* Mini bar chart */}
+                            <div className="flex items-end gap-3 h-20">
+                                {rows.map(({ ph, segments_found, worst_severity, used_global_fallback }) => {
+                                    const heightPct = maxSegs > 0 ? ((segments_found || 0) / maxSegs) * 100 : 0;
+                                    const barColor = SEV_COLOR[worst_severity] || "#e5e7eb";
+                                    return (
+                                        <div key={ph} className="flex flex-1 flex-col items-center gap-1">
+                                            <span className="text-[11px] font-semibold text-gray-700">
+                                                {segments_found || 0}
+                                            </span>
+                                            <div className="w-full flex items-end" style={{ height: 48 }}>
+                                                <div
+                                                    className="w-full rounded-t transition-all"
+                                                    style={{
+                                                        height: `${Math.max(segments_found ? 8 : 2, heightPct * 0.48)}px`,
+                                                        backgroundColor: segments_found ? barColor : "#f3f4f6",
+                                                    }}
+                                                />
+                                            </div>
+                                            <span className="text-[10px] text-gray-500 truncate w-full text-center">
+                                                {ph}
+                                            </span>
+                                            {used_global_fallback && (
+                                                <span className="text-[9px] text-amber-500" title="Insufficient rows for per-phase threshold">
+                                                    ↩ global
+                                                </span>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            {/* Compact table */}
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-xs">
+                                    <thead>
+                                        <tr className="border-b border-gray-100 text-left text-gray-400 uppercase tracking-wide">
+                                            <th className="pb-1.5 pr-3 font-medium">Phase</th>
+                                            <th className="pb-1.5 pr-3 font-medium">Rows</th>
+                                            <th className="pb-1.5 pr-3 font-medium">Segments</th>
+                                            <th className="pb-1.5 pr-3 font-medium">Top Parameter</th>
+                                            <th className="pb-1.5 pr-3 font-medium">Threshold</th>
+                                            <th className="pb-1.5 font-medium">Baseline</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-50">
+                                        {rows.map(({ ph, n_rows, segments_found, worst_severity, top_param, threshold, used_global_fallback }) => (
+                                            <tr key={ph} className="text-gray-700">
+                                                <td className="py-1.5 pr-3 font-semibold">
+                                                    <span
+                                                        className="inline-block h-2 w-2 rounded-sm mr-1.5"
+                                                        style={{ backgroundColor: PHASE_COLORS[ph] || "#94a3b8" }}
+                                                    />
+                                                    {ph}
+                                                </td>
+                                                <td className="py-1.5 pr-3 text-gray-500">{n_rows?.toLocaleString() ?? "—"}</td>
+                                                <td className="py-1.5 pr-3">
+                                                    {segments_found > 0 ? (
+                                                        <span
+                                                            className="font-semibold"
+                                                            style={{ color: SEV_COLOR[worst_severity] || "#374151" }}
+                                                        >
+                                                            {segments_found}
+                                                        </span>
+                                                    ) : (
+                                                        <span className="text-gray-400">0</span>
+                                                    )}
+                                                </td>
+                                                <td className="py-1.5 pr-3 text-gray-600 max-w-[140px] truncate">
+                                                    {top_param ?? <span className="text-gray-300">—</span>}
+                                                </td>
+                                                <td className="py-1.5 pr-3 font-mono text-gray-500">
+                                                    {typeof threshold === "number" ? threshold.toFixed(5) : "—"}
+                                                </td>
+                                                <td className="py-1.5 text-gray-400 text-[10px]">
+                                                    {used_global_fallback
+                                                        ? "global fallback"
+                                                        : "per-phase"}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </section>
+                    );
+                })()}
 
                 <section className="space-y-4">
                     <div>
@@ -4601,6 +4927,112 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 );
             })()}
 
+            {/* ── Flight Track Map (Task 13) ──────────────────────────────────────── */}
+            {latParam && lonParam && mapTrackPoints.length > 0 && (
+                <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+                    <div className="flex items-center justify-between">
+                        <h2 className="text-sm font-semibold text-gray-900">Flight Track</h2>
+                        <button
+                            type="button"
+                            onClick={() => setMapTrackOpen((v) => !v)}
+                            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50 transition"
+                        >
+                            {mapTrackOpen ? "Hide ▲" : "Show ▼"}
+                        </button>
+                    </div>
+                    {mapTrackOpen && (
+                        <div className="space-y-3">
+                            <div
+                                className="overflow-hidden rounded-lg border border-gray-200"
+                                style={{ height: 300 }}
+                            >
+                                {mapBounds && (
+                                    <MapContainer
+                                        bounds={mapBounds}
+                                        boundsOptions={{ padding: [20, 20] }}
+                                        style={{ height: "100%", width: "100%" }}
+                                        scrollWheelZoom={false}
+                                    >
+                                        <TileLayer
+                                            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                                            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                                        />
+                                        {mapPhasePolylines.map((seg, i) => (
+                                            <Polyline
+                                                key={i}
+                                                positions={seg.points}
+                                                pathOptions={{
+                                                    color: PHASE_COLORS[seg.phase] || "#94a3b8",
+                                                    weight: 3,
+                                                    opacity: 0.85,
+                                                }}
+                                            />
+                                        ))}
+                                        {/* Departure — green */}
+                                        <CircleMarker
+                                            center={[mapTrackPoints[0].lat, mapTrackPoints[0].lon]}
+                                            radius={6}
+                                            pathOptions={{ color: "#15803d", fillColor: "#22c55e", fillOpacity: 1 }}
+                                        />
+                                        {/* Arrival — red */}
+                                        <CircleMarker
+                                            center={[
+                                                mapTrackPoints[mapTrackPoints.length - 1].lat,
+                                                mapTrackPoints[mapTrackPoints.length - 1].lon,
+                                            ]}
+                                            radius={6}
+                                            pathOptions={{ color: "#b91c1c", fillColor: "#ef4444", fillOpacity: 1 }}
+                                        />
+                                        {/* Scrubber position — amber */}
+                                        {mapScrubPosition && (
+                                            <CircleMarker
+                                                center={[mapScrubPosition.lat, mapScrubPosition.lon]}
+                                                radius={9}
+                                                pathOptions={{ color: "#d97706", fillColor: "#f59e0b", fillOpacity: 0.9 }}
+                                            />
+                                        )}
+                                    </MapContainer>
+                                )}
+                            </div>
+                            {timeDomain && (
+                                <div className="space-y-1">
+                                    <input
+                                        type="range"
+                                        min={timeDomain.min}
+                                        max={timeDomain.max}
+                                        step={Math.max(1, (timeDomain.max - timeDomain.min) / 500)}
+                                        value={mapScrubTime ?? timeDomain.min}
+                                        onChange={(e) => setMapScrubTime(Number(e.target.value))}
+                                        className="w-full accent-amber-500"
+                                    />
+                                    <p className="text-center text-[11px] text-gray-500">
+                                        {mapScrubTime !== null
+                                            ? formatSessionTime(mapScrubTime)
+                                            : "Drag to scrub position along track"}
+                                    </p>
+                                </div>
+                            )}
+                            <div className="flex flex-wrap gap-4 text-[11px] text-gray-500">
+                                <span className="flex items-center gap-1.5">
+                                    <span className="inline-block h-2 w-2 rounded-full bg-green-500" />
+                                    Departure
+                                </span>
+                                <span className="flex items-center gap-1.5">
+                                    <span className="inline-block h-2 w-2 rounded-full bg-red-500" />
+                                    Arrival
+                                </span>
+                                {mapScrubPosition && (
+                                    <span className="flex items-center gap-1.5">
+                                        <span className="inline-block h-2 w-2 rounded-full bg-amber-500" />
+                                        {formatSessionTime(mapScrubPosition.time)}
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </section>
+            )}
+
             {/* ── Occurrence info strip (Task 8) ────────────────────────────────── */}
             {occurrenceWindow?.start != null && occurrenceWindow?.end != null ? (
                 <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm shadow-sm">
@@ -4673,6 +5105,53 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
                 return (
                     <section className="rounded-xl border border-gray-200 bg-white shadow-sm">
+                        {/* Task 14 — case description suggestion banner */}
+                        {suggestedCorrelationParams?.matched && !suggestionDismissed && (
+                            <div className="flex items-start gap-3 rounded-t-xl border-b border-blue-200 bg-blue-50 px-4 py-3">
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-2">
+                                        <p className="text-xs font-semibold text-blue-800">
+                                            Parameters suggested from case description
+                                        </p>
+                                        <button
+                                            type="button"
+                                            onClick={() => setWhyExpanded((v) => !v)}
+                                            className="text-[11px] text-blue-500 underline hover:text-blue-700"
+                                        >
+                                            {whyExpanded ? "Hide ▲" : "Why these? ▼"}
+                                        </button>
+                                    </div>
+                                    {whyExpanded && (
+                                        <p className="mt-0.5 text-[11px] text-blue-600">
+                                            Matched: {suggestedCorrelationParams.matchedKeywords.join(" · ")}
+                                        </p>
+                                    )}
+                                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                                        {suggestedCorrelationParams.params.map((p) => (
+                                            <span
+                                                key={p}
+                                                className="rounded-full border border-blue-200 bg-white px-2 py-0.5 text-[11px] font-medium text-blue-800"
+                                            >
+                                                {parameterDisplayMap[p]?.label || p}
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => setSuggestionDismissed(true)}
+                                    aria-label="Dismiss suggestion"
+                                    className="shrink-0 text-blue-400 hover:text-blue-600 text-lg leading-none mt-0.5"
+                                >
+                                    ×
+                                </button>
+                            </div>
+                        )}
+                        {suggestedCorrelationParams !== null && !suggestedCorrelationParams.matched && (
+                            <p className="rounded-t-xl border-b border-gray-100 bg-gray-50 px-4 py-2 text-[11px] text-gray-400">
+                                No parameter suggestions for this case description — showing default selection (IAS, Pitch, Roll, Vertical Speed)
+                            </p>
+                        )}
                         {/* Header */}
                         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
                             <div>
