@@ -1,9 +1,0 @@
-node_modules
-server/node_modules
-build
-.git
-.gitignore
-*.md
-.env
-.env.*
-npm-debug.log*
