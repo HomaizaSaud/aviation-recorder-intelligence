@@ -36,13 +36,13 @@ ALT_CANDIDATES: List[str] = [
     "Altitude (ft)", "Altitude", "ALT", "RALT",
 ]
 RPM_CANDIDATES: List[str] = [
-    "RPM", "Engine RPM", "Engine 1 RPM", "RPM Left", "ENG1_RPM", "RPM1",
+    "RPM L", "RPM R", "RPM", "Engine RPM", "Engine 1 RPM", "RPM Left", "ENG1_RPM", "RPM1",
 ]
 OIL_PRESS_CANDIDATES: List[str] = [
     "Oil Pressure (PSI)", "Oil Pressure", "OIL_PRESS", "OIL_PSI", "OILP",
 ]
 OIL_TEMP_CANDIDATES: List[str] = [
-    "Oil Temperature (C)", "Oil Temperature", "OIL_TEMP", "OILT", "OIL_TEMP_C",
+    "Oil Temp (deg C)", "Oil Temperature (C)", "Oil Temperature", "OIL_TEMP", "OILT", "OIL_TEMP_C",
 ]
 EGT_CANDIDATES: List[str] = [
     "EGT (deg F)", "EGT (F)", "EGT", "EGT1", "EGT_1", "EGT1_DEG",
@@ -157,9 +157,30 @@ RULE_DEFS: List[Dict] = [
 
 
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    df_cols = list(df.columns)
+    df_cols_lower = [c.lower() for c in df_cols]
+
+    # Pass 1: case-sensitive exact match (fastest, highest fidelity)
     for name in candidates:
         if name in df.columns:
             return name
+
+    # Pass 2: case-insensitive exact match
+    for name in candidates:
+        name_l = name.lower()
+        for i, col_l in enumerate(df_cols_lower):
+            if name_l == col_l:
+                return df_cols[i]
+
+    # Pass 3: candidate is a case-insensitive substring of the column name.
+    # Allows short candidates like "roll" to match "Roll (deg)",
+    # and "vertical speed" to match "Vertical Speed (ft/min)".
+    for name in candidates:
+        name_l = name.lower()
+        for i, col_l in enumerate(df_cols_lower):
+            if name_l in col_l:
+                return df_cols[i]
+
     return None
 
 
