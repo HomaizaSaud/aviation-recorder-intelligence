@@ -696,10 +696,13 @@ def detect_anomalies(
             vals = ref_df[col].to_numpy(dtype=float)
             if vals.size == 0:
                 continue
+            bstd = float(np.std(vals))
             stats[col] = {
                 "baseline_p5": float(np.percentile(vals, 5)),
                 "baseline_p95": float(np.percentile(vals, 95)),
                 "baseline_median": float(np.median(vals)),
+                "baseline_mean": float(np.mean(vals)),
+                "baseline_std": bstd if bstd > 1e-9 else 1.0,
             }
         return stats
 
@@ -726,15 +729,59 @@ def detect_anomalies(
             if segment_values.size == 0:
                 continue
             baseline = baseline_stats.get(name, {})
+            seg_min = float(np.nanmin(segment_values))
+            seg_max = float(np.nanmax(segment_values))
+            bm = baseline.get("baseline_mean")
+            bstd_val = baseline.get("baseline_std") or 1.0
+
+            # actual_value: parameter value at the peak-anomaly row within the segment
+            seg_scores_local = timeline_scores[segment_mask]
+            if seg_scores_local.size > 0 and segment_values.size > 0:
+                peak_local = int(np.argmax(seg_scores_local))
+                actual_val = float(segment_values[peak_local]) if peak_local < segment_values.size else None
+            else:
+                actual_val = None
+
+            if actual_val is not None and bm is not None and np.isfinite(actual_val) and np.isfinite(bm):
+                deviation_val = actual_val - bm
+                deviation_sigma_raw = deviation_val / bstd_val if bstd_val else None
+            else:
+                deviation_val = None
+                deviation_sigma_raw = None
+
+            deviation_sigma_out = (
+                round(float(deviation_sigma_raw), 2)
+                if deviation_sigma_raw is not None and np.isfinite(deviation_sigma_raw)
+                else None
+            )
+
+            if deviation_sigma_out is not None:
+                if deviation_sigma_out > 2.5:
+                    deviation_type_out = "spike"
+                elif deviation_sigma_out < -2.5:
+                    deviation_type_out = "drop"
+                elif abs(deviation_sigma_out) >= 1.0:
+                    deviation_type_out = "drift"
+                else:
+                    deviation_type_out = "normal"
+            else:
+                deviation_type_out = None
+
             driver_stats.append(
                 {
                     "param": name,
                     "unit": _extract_unit(name),
-                    "segment_min": float(np.min(segment_values)),
-                    "segment_max": float(np.max(segment_values)),
+                    "segment_min": seg_min,
+                    "segment_max": seg_max,
                     "baseline_p5": baseline.get("baseline_p5"),
                     "baseline_p95": baseline.get("baseline_p95"),
                     "baseline_median": baseline.get("baseline_median"),
+                    "baseline_mean": bm,
+                    "baseline_std": bstd_val,
+                    "actual_value": round(actual_val, 4) if actual_val is not None and np.isfinite(actual_val) else None,
+                    "deviation": round(float(deviation_val), 4) if deviation_val is not None and np.isfinite(deviation_val) else None,
+                    "deviation_sigma": deviation_sigma_out,
+                    "deviation_type": deviation_type_out,
                 }
             )
         segment["driver_stats"] = driver_stats

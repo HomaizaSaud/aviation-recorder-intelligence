@@ -2581,6 +2581,12 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const getDriverDeviationLabel = useCallback((driver) => {
         const stats = driver?.stats;
         if (!stats) return null;
+        // Prefer sigma-based label when available (Task 11)
+        const { deviation_sigma } = stats;
+        if (Number.isFinite(deviation_sigma) && Math.abs(deviation_sigma) >= 0.3) {
+            return `${deviation_sigma >= 0 ? "↑" : "↓"}${Math.abs(deviation_sigma).toFixed(1)}σ`;
+        }
+        // Fallback: percentage label for saved results without sigma data
         const { segment_max, segment_min, baseline_median } = stats;
         if (!Number.isFinite(baseline_median) || baseline_median === 0) return null;
         const extreme =
@@ -3773,6 +3779,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         <p className="text-xs text-gray-700">
                                             {topDriversList.map((d, di) => {
                                                 const dev = getDriverDeviationLabel(d);
+                                                const hasSigma = Number.isFinite(d.stats?.deviation_sigma);
+                                                const segPhase = topSeg?.phase_label;
+                                                const direction = (d.stats?.deviation_sigma ?? 0) >= 0 ? "above" : "below";
                                                 return (
                                                     <span key={d.param ?? di}>
                                                         {di > 0 && (
@@ -3792,6 +3801,11 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                                 }`}
                                                             >
                                                                 {dev}
+                                                            </span>
+                                                        )}
+                                                        {hasSigma && segPhase && (
+                                                            <span className="ml-1 text-gray-400">
+                                                                {direction} {segPhase} baseline
                                                             </span>
                                                         )}
                                                     </span>
@@ -4458,6 +4472,101 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                         {interpretation.note}
                                                     </p>
                                                 </div>
+                                                {/* Task 11 — Explainability table (AI and AI+Rule segments) */}
+                                                {segment.detection_source !== "rules" && topDrivers.some((d) => d.stats?.deviation_sigma != null) && (
+                                                    <div className="mb-4 overflow-hidden rounded-xl border border-gray-200 bg-white">
+                                                        <div className="border-b border-gray-100 bg-gray-50 px-3 py-1.5">
+                                                            <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+                                                                Parameter Analysis
+                                                            </span>
+                                                        </div>
+                                                        <table className="w-full text-xs">
+                                                            <thead>
+                                                                <tr className="border-b border-gray-100 bg-gray-50">
+                                                                    <th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">Parameter</th>
+                                                                    <th className="px-3 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">Phase</th>
+                                                                    <th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wider text-gray-400">Baseline (mean±std)</th>
+                                                                    <th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wider text-gray-400">Actual</th>
+                                                                    <th className="px-3 py-1.5 text-right text-[10px] font-semibold uppercase tracking-wider text-gray-400">Deviation</th>
+                                                                    <th className="px-3 py-1.5 text-center text-[10px] font-semibold uppercase tracking-wider text-gray-400">Type</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody className="divide-y divide-gray-50">
+                                                                {topDrivers.filter((d) => d.stats?.deviation_sigma != null).map((driver) => {
+                                                                    const s = driver.stats;
+                                                                    const unitSuffix = driver.unit ? ` ${driver.unit}` : "";
+                                                                    const baselineStr =
+                                                                        s.baseline_mean != null && s.baseline_std != null
+                                                                            ? `${s.baseline_mean.toFixed(1)} ± ${s.baseline_std.toFixed(1)}${unitSuffix}`
+                                                                            : s.baseline_median != null
+                                                                            ? `${s.baseline_median.toFixed(1)}${unitSuffix}`
+                                                                            : "—";
+                                                                    const actualStr = s.actual_value != null ? `${Number(s.actual_value).toFixed(2)}${unitSuffix}` : "—";
+                                                                    const sigma = s.deviation_sigma;
+                                                                    const sigmaStr = sigma != null ? `${sigma >= 0 ? "+" : ""}${sigma.toFixed(1)}σ` : "—";
+                                                                    const devType = s.deviation_type;
+                                                                    const typeConfig = {
+                                                                        spike: { label: "Spike", cls: "bg-red-100 text-red-700" },
+                                                                        drop:  { label: "Drop",  cls: "bg-blue-100 text-blue-700" },
+                                                                        drift: { label: "Drift", cls: "bg-amber-100 text-amber-700" },
+                                                                        normal:{ label: "Normal",cls: "bg-gray-100 text-gray-600" },
+                                                                    }[devType] ?? { label: "—", cls: "bg-gray-100 text-gray-400" };
+                                                                    const rowPhase = segment?.phase_label ?? getSegmentPhaseLabel(segment) ?? "—";
+                                                                    return (
+                                                                        <tr key={driver.param} className="transition-colors hover:bg-gray-50">
+                                                                            <td className="px-3 py-2 font-medium text-gray-800">
+                                                                                {driver.label}{driver.unit ? ` (${driver.unit})` : ""}
+                                                                            </td>
+                                                                            <td className="px-3 py-2 text-gray-500">{rowPhase}</td>
+                                                                            <td className="px-3 py-2 text-right font-mono text-gray-600">{baselineStr}</td>
+                                                                            <td className="px-3 py-2 text-right font-mono text-gray-800">{actualStr}</td>
+                                                                            <td className={`px-3 py-2 text-right font-mono font-semibold ${sigma != null && sigma >= 0 ? "text-red-600" : "text-blue-600"}`}>{sigmaStr}</td>
+                                                                            <td className="px-3 py-2 text-center">
+                                                                                <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${typeConfig.cls}`}>
+                                                                                    {typeConfig.label}
+                                                                                </span>
+                                                                            </td>
+                                                                        </tr>
+                                                                    );
+                                                                })}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                )}
+
+                                                {/* Task 11 — Rule confirmation note for AI+Rule segments */}
+                                                {segment.detection_source === "both" && segment.rule_findings?.length > 0 && (
+                                                    <div className="mb-4 rounded-lg border border-purple-200 bg-purple-50 px-3 py-2">
+                                                        <p className="text-[11px] text-purple-700">
+                                                            <span className="font-semibold">Also confirmed by rule:</span>{" "}
+                                                            {segment.rule_findings.map((rf) => rf.rule_name).join(", ")}
+                                                        </p>
+                                                    </div>
+                                                )}
+
+                                                {/* Task 11 — Rule evidence card for Rule-only segments */}
+                                                {segment.detection_source === "rules" && segment.rule_findings?.length > 0 && (
+                                                    <div className="mb-4 overflow-hidden rounded-xl border border-purple-200 bg-purple-50">
+                                                        <div className="border-b border-purple-100 px-3 py-1.5">
+                                                            <span className="text-[10px] font-semibold uppercase tracking-wider text-purple-600">
+                                                                Rule Findings
+                                                            </span>
+                                                        </div>
+                                                        <div className="divide-y divide-purple-100">
+                                                            {segment.rule_findings.map((rf, rfi) => (
+                                                                <div key={rfi} className="px-3 py-2">
+                                                                    <p className="text-xs font-semibold text-purple-800">{rf.rule_name}</p>
+                                                                    <p className="mt-0.5 text-xs text-purple-600">
+                                                                        {rf.parameter} reached{" "}
+                                                                        {rf.peak_value != null ? Number(rf.peak_value).toFixed(1) : "—"}
+                                                                        {" "}— limit: {rf.threshold}
+                                                                    </p>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                )}
+
                                                 <div className="grid gap-4 lg:grid-cols-3">
                                                     {topDrivers.length > 0 ? (
                                                         topDrivers.map((driver) => {
