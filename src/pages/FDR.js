@@ -1053,6 +1053,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [mapTrackOpen, setMapTrackOpen] = useState(false);
     const [mapScrubTime, setMapScrubTime] = useState(null);
     const [rulesResult, setRulesResult] = useState(null);
+    const [rulesWasAttempted, setRulesWasAttempted] = useState(false);
     const [detectionMethodFilter, setDetectionMethodFilter] = useState("all");
     const [rulesCheckedOpen, setRulesCheckedOpen] = useState(false);
     const [isLoadingFdrData, setIsLoadingFdrData] = useState(false);
@@ -2043,6 +2044,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         setAnomalyError("");
         setAnomalyResult(null);
         setRulesResult(null);
+        setRulesWasAttempted(true);
         setDetectionMethodFilter("all");
         setWorkflowStage("detectionRunning");
         const detectionStartedAt = new Date().toISOString();
@@ -2742,6 +2744,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         setSuggestionDismissed(false);
         setWhyExpanded(false);
         setRulesResult(null);
+        setRulesWasAttempted(false);
         setDetectionMethodFilter("all");
         setRulesCheckedOpen(false);
     }, [caseNumber]);
@@ -4641,7 +4644,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 {/* Task 10 — Rules checked section */}
                 {(() => {
                     const rulesChecked = rulesResult?.rules_checked || [];
-                    const rulesFailed = rulesResult === null && anomalyResult !== null;
+                    // Only flag as "failed" if detection was actually attempted this session.
+                    // Avoids showing "unavailable" when viewing previously saved analysis.
+                    const rulesFailed = rulesWasAttempted && rulesResult === null && anomalyResult !== null;
                     if (!rulesFailed && rulesChecked.length === 0) return null;
 
                     const checkedCount = rulesChecked.filter((r) => r.status === "checked").length;
