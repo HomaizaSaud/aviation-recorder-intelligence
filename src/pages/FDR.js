@@ -2086,8 +2086,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         try {
             // Rules run in parallel with AI detection — fast (no ML training).
             // Failure is caught here so it never blocks the AI result.
+            console.log('[FDR:rules:DEBUG] firing fetchFdrRules for case:', caseNumber);
             const rulesPromise = fetchFdrRules(caseNumber).catch((err) => {
-                console.warn("[FDR Task10] Rules detection failed:", err?.message);
+                console.warn('[FDR:rules:DEBUG] fetchFdrRules FAILED:', err?.message, '| status:', err?.status);
                 return null;
             });
 
@@ -2181,6 +2182,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
             });
             // Rules should already be resolved since they're faster than AI.
             const rulesData = await rulesPromise;
+            console.log('[FDR:rules:DEBUG] rulesData received:', rulesData);
+            console.log('[FDR:rules:DEBUG] findings count:', rulesData?.findings?.length ?? 'null/undefined');
+            console.log('[FDR:rules:DEBUG] rules_checked count:', rulesData?.rules_checked?.length ?? 'null/undefined');
             setRulesResult(rulesData);
 
             clearPendingFdrRun();

@@ -569,6 +569,10 @@ const detectRulesForCase = async (caseNumber) => {
 
   try {
     await fs.writeFile(tempFilePath, fileBuffer);
+    console.log('[rules:DEBUG] python bin  :', PYTHON_BIN);
+    console.log('[rules:DEBUG] module      :', PYTHON_RULES_MODULE);
+    console.log('[rules:DEBUG] file path   :', tempFilePath);
+    console.log('[rules:DEBUG] cwd         :', PYTHON_CWD);
     const { stdout, stderr } = await execFileAsync(
       PYTHON_BIN,
       ['-m', PYTHON_RULES_MODULE, tempFilePath],
@@ -581,10 +585,18 @@ const detectRulesForCase = async (caseNumber) => {
     if (stderr) {
       console.error('[rules] python stderr:', stderr);
     }
-    return JSON.parse(stdout);
+    console.log('[rules:DEBUG] stdout length:', stdout?.length, '| first 200 chars:', stdout?.slice(0, 200));
+    const parsed = JSON.parse(stdout);
+    console.log('[rules:DEBUG] parsed OK — findings:', parsed?.findings?.length, '| rules_checked:', parsed?.rules_checked?.length);
+    return parsed;
   } catch (error) {
+    console.error('[rules:DEBUG] CAUGHT ERROR:', error?.message);
+    console.error('[rules:DEBUG] error code  :', error?.code);
     if (error?.stderr) {
       console.error('[rules] python stderr:', error.stderr);
+    }
+    if (error?.stdout) {
+      console.error('[rules:DEBUG] python stdout (partial):', error.stdout?.slice(0, 500));
     }
     const message = parsePythonErrorMessage(error);
     if (message) {
