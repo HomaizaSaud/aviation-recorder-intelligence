@@ -188,6 +188,13 @@ export const fetchFdrPhases = async (caseId) => {
   return response;
 };
 
+export const fetchFdrRules = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/rules`, {
+    method: 'POST',
+  });
+  return response;
+};
+
 export const fetchFdrOccurrence = async (caseId) => {
   const response = await request(`/cases/${caseId}/fdr/occurrence`, {
     method: 'GET',

@@ -32,7 +32,7 @@ const {
   updateNote,
   deleteNote,
 } = require('../services/notes');
-const { analyzeFdrForCase, segmentFlightsForCase, detectPhasesForCase } = require('../services/anomaly');
+const { analyzeFdrForCase, segmentFlightsForCase, detectPhasesForCase, detectRulesForCase } = require('../services/anomaly');
 const { getFdrOccurrence, setFdrOccurrence } = require('../services/cases');
 const {
   denoiseCvrForCase,
@@ -109,6 +109,15 @@ router.post('/:caseNumber/fdr/segments', async (req, res, next) => {
 router.post('/:caseNumber/fdr/phases', async (req, res, next) => {
   try {
     const result = await detectPhasesForCase(req.params.caseNumber);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/rules', async (req, res, next) => {
+  try {
+    const result = await detectRulesForCase(req.params.caseNumber);
     res.json(result);
   } catch (error) {
     next(error);

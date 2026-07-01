@@ -42,6 +42,7 @@ const PYTHON_BIN = process.env.PYTHON_BIN || 'python3';
 const PYTHON_MODULE = 'services.fdr_anomaly.run_detect';
 const PYTHON_SEGMENT_MODULE = 'services.fdr_anomaly.run_segment';
 const PYTHON_PHASE_MODULE = 'services.fdr_anomaly.run_phase';
+const PYTHON_RULES_MODULE = 'services.fdr_anomaly.run_rules';
 const PYTHON_CWD = path.resolve(__dirname, '../../..');
 const execFileAsync = promisify(execFile);
 
@@ -542,8 +543,64 @@ const detectPhasesForCase = async (caseNumber) => {
   }
 };
 
+const detectRulesForCase = async (caseNumber) => {
+  const caseData = await findCaseByNumber(caseNumber);
+  if (!caseData) {
+    const error = new Error('Case not found');
+    error.status = 404;
+    throw error;
+  }
+
+  const fdrAttachment = findFdrAttachment(caseData);
+  if (!fdrAttachment || !fdrAttachment.storage || !fdrAttachment.storage.objectKey) {
+    const error = new Error('No FDR attachment found for this case.');
+    error.status = 404;
+    throw error;
+  }
+
+  const fileBuffer = await downloadObjectAsBuffer({
+    bucket: fdrAttachment.storage.bucket,
+    objectKey: fdrAttachment.storage.objectKey,
+  });
+
+  const extension = path.extname(fdrAttachment.storage.objectKey || '') || '.csv';
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fdr-rules-'));
+  const tempFilePath = path.join(tempDir, `fdr${extension}`);
+
+  try {
+    await fs.writeFile(tempFilePath, fileBuffer);
+    const { stdout, stderr } = await execFileAsync(
+      PYTHON_BIN,
+      ['-m', PYTHON_RULES_MODULE, tempFilePath],
+      {
+        cwd: PYTHON_CWD,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024 * 10,
+      },
+    );
+    if (stderr) {
+      console.error('[rules] python stderr:', stderr);
+    }
+    return JSON.parse(stdout);
+  } catch (error) {
+    if (error?.stderr) {
+      console.error('[rules] python stderr:', error.stderr);
+    }
+    const message = parsePythonErrorMessage(error);
+    if (message) {
+      const pythonError = new Error(message);
+      pythonError.status = 400;
+      throw pythonError;
+    }
+    throw error;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+};
+
 module.exports = {
   analyzeFdrForCase,
   segmentFlightsForCase,
   detectPhasesForCase,
+  detectRulesForCase,
 };

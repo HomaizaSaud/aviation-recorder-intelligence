@@ -17,7 +17,7 @@ import {
 } from "recharts";
 import NotesPanel from "../components/NotesPanel";
 import { fetchCaseByNumber, updateCase } from "../api/cases";
-import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence } from "../api/anomaly";
+import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence, fetchFdrRules } from "../api/anomaly";
 import { useAuth } from "../hooks/useAuth";
 import useRecentCases from "../hooks/useRecentCases";
 import { buildCasePreview } from "../utils/caseDisplay";
@@ -1052,6 +1052,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [whyExpanded, setWhyExpanded] = useState(false);
     const [mapTrackOpen, setMapTrackOpen] = useState(false);
     const [mapScrubTime, setMapScrubTime] = useState(null);
+    const [rulesResult, setRulesResult] = useState(null);
+    const [detectionMethodFilter, setDetectionMethodFilter] = useState("all");
+    const [rulesCheckedOpen, setRulesCheckedOpen] = useState(false);
     const [isLoadingFdrData, setIsLoadingFdrData] = useState(false);
     const [fdrDataError, setFdrDataError] = useState("");
     const [caseSummaryCopied, setCaseSummaryCopied] = useState(false);
@@ -2039,6 +2042,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         setIsRunningDetection(true);
         setAnomalyError("");
         setAnomalyResult(null);
+        setRulesResult(null);
+        setDetectionMethodFilter("all");
         setWorkflowStage("detectionRunning");
         const detectionStartedAt = new Date().toISOString();
         detectionStartRef.current = detectionStartedAt;
@@ -2077,6 +2082,13 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         });
 
         try {
+            // Rules run in parallel with AI detection — fast (no ML training).
+            // Failure is caught here so it never blocks the AI result.
+            const rulesPromise = fetchFdrRules(caseNumber).catch((err) => {
+                console.warn("[FDR Task10] Rules detection failed:", err?.message);
+                return null;
+            });
+
             const result = await runFdrAnomalyDetection(caseNumber, {
                 rows: normalizedRows,
             });
@@ -2165,6 +2177,10 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     fdrAnalysisUpdatedAt: updatedAt,
                 },
             });
+            // Rules should already be resolved since they're faster than AI.
+            const rulesData = await rulesPromise;
+            setRulesResult(rulesData);
+
             clearPendingFdrRun();
             pendingRunRef.current = null;
             setWorkflowStage("results");
@@ -2591,13 +2607,71 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
     const extraSegmentsOmitted = anomalyResult?.summary?.extra_segments_omitted ?? 0;
 
-    const filteredSegments = useMemo(() => {
-        if (severityFilter === "all") return segments;
-        return segments.filter((s) => {
-            const sev = (s?.severity ?? "low").toLowerCase();
-            return sev === severityFilter;
+    // Task 10 — merge AI segments with rule-based findings.
+    const mergedSegments = useMemo(() => {
+        const OVERLAP_GAP = 30; // seconds — same as SEGMENT_GAP_SECONDS in Python
+        const aiSegs = segments.map((s) => ({ ...s, detection_source: "ai" }));
+        const ruleFindings = rulesResult?.findings || [];
+
+        if (!ruleFindings.length) return aiSegs;
+
+        // Work on a mutable copy so we can annotate matched AI segments.
+        const merged = aiSegs.map((s) => ({ ...s }));
+        const unmatchedRules = [];
+
+        ruleFindings.forEach((rf) => {
+            const matchIdx = merged.findIndex(
+                (ai) =>
+                    ai.detection_source !== "rules" &&
+                    ai.start_time <= (rf.end_time ?? rf.start_time) + OVERLAP_GAP &&
+                    (ai.end_time ?? ai.start_time) >= (rf.start_time ?? 0) - OVERLAP_GAP
+            );
+            if (matchIdx >= 0) {
+                merged[matchIdx] = {
+                    ...merged[matchIdx],
+                    detection_source: "both",
+                    rule_findings: [
+                        ...(merged[matchIdx].rule_findings || []),
+                        rf,
+                    ],
+                };
+            } else {
+                unmatchedRules.push({
+                    ...rf,
+                    detection_source: "rules",
+                    score_peak: null,
+                    top_drivers: [{ parameter: rf.parameter, error: 0 }],
+                    explanation: `${rf.rule_name}: ${rf.parameter} reached ${rf.peak_value} (limit: ${rf.threshold})`,
+                });
+            }
         });
-    }, [segments, severityFilter]);
+
+        const _SEV = { high: 3, med: 2, low: 1 };
+        return [...merged, ...unmatchedRules].sort(
+            (a, b) =>
+                (_SEV[b.severity] || 0) - (_SEV[a.severity] || 0) ||
+                (b.score_peak || 0) - (a.score_peak || 0)
+        );
+    }, [segments, rulesResult]);
+
+    const filteredSegments = useMemo(() => {
+        let result = mergedSegments;
+        if (severityFilter !== "all") {
+            result = result.filter(
+                (s) => (s?.severity ?? "low").toLowerCase() === severityFilter
+            );
+        }
+        if (detectionMethodFilter !== "all") {
+            result = result.filter((s) => {
+                const src = s.detection_source || "ai";
+                if (detectionMethodFilter === "ai") return src === "ai";
+                if (detectionMethodFilter === "rules") return src === "rules";
+                if (detectionMethodFilter === "both") return src === "both";
+                return true;
+            });
+        }
+        return result;
+    }, [mergedSegments, severityFilter, detectionMethodFilter]);
 
     useEffect(() => {
         if (!pendingScrollToChartsRef.current) return;
@@ -2663,10 +2737,13 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         return { matched: true, params, matchedKeywords: matchedGroups.map((g) => g.label) };
     }, [selectedCase, availableParameters, parameterDisplayMap]);
 
-    // Reset suggestion dismissal when case changes.
+    // Reset per-case UI state when case changes.
     useEffect(() => {
         setSuggestionDismissed(false);
         setWhyExpanded(false);
+        setRulesResult(null);
+        setDetectionMethodFilter("all");
+        setRulesCheckedOpen(false);
     }, [caseNumber]);
 
     // Default correlation param selection: prefer keyword-derived suggestions, then
@@ -4116,10 +4193,10 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 )}
 
                 <section className="rounded-3xl bg-white p-6 border border-gray-200">
-                    <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
                         <div>
                             <h2 className="text-lg font-semibold text-gray-900">
-                                All Findings ({segments.length})
+                                All Findings ({mergedSegments.length})
                             </h2>
                             <p className="text-sm text-gray-500">
                                 Evidence-ready review of flagged intervals and contributing parameters.
@@ -4129,8 +4206,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             {["all", "high", "med", "low"].map((f) => {
                                 const fCount =
                                     f === "all"
-                                        ? segments.length
-                                        : segments.filter(
+                                        ? mergedSegments.length
+                                        : mergedSegments.filter(
                                               (s) =>
                                                   (s?.severity ?? "low").toLowerCase() === f
                                           ).length;
@@ -4165,9 +4242,55 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             })}
                         </div>
                     </div>
+
+                    {/* Task 10 — detection method toggle */}
+                    {rulesResult && (
+                        <div className="flex flex-wrap items-center gap-1.5 mb-4">
+                            {[
+                                { key: "all", label: "All" },
+                                { key: "ai", label: "AI only" },
+                                { key: "rules", label: "Rules only" },
+                                { key: "both", label: "Confirmed by both" },
+                            ].map(({ key, label }) => {
+                                const cnt =
+                                    key === "all"
+                                        ? mergedSegments.length
+                                        : mergedSegments.filter(
+                                              (s) => (s.detection_source || "ai") === key
+                                          ).length;
+                                const active = detectionMethodFilter === key;
+                                const colors = {
+                                    all: active
+                                        ? "bg-gray-800 text-white border-gray-800"
+                                        : "bg-white text-gray-600 border-gray-200 hover:bg-gray-50",
+                                    ai: active
+                                        ? "bg-blue-600 text-white border-blue-600"
+                                        : "bg-white text-blue-700 border-blue-200 hover:bg-blue-50",
+                                    rules: active
+                                        ? "bg-purple-600 text-white border-purple-600"
+                                        : "bg-white text-purple-700 border-purple-200 hover:bg-purple-50",
+                                    both: active
+                                        ? "bg-rose-600 text-white border-rose-600"
+                                        : "bg-white text-rose-700 border-rose-200 hover:bg-rose-50",
+                                };
+                                return (
+                                    <button
+                                        key={key}
+                                        type="button"
+                                        onClick={() => setDetectionMethodFilter(key)}
+                                        className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${colors[key]}`}
+                                    >
+                                        {label} ({cnt})
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    )}
+
                     <div className="space-y-3">
                         {filteredSegments.length > 0 ? (
                             filteredSegments.map((segment, index) => {
+
                                 const segmentKey = `${segment?.start_time ?? "seg"}-${index}`;
                                 const isExpanded = expandedSegments.has(segmentKey);
                                 const topDrivers = resolveSegmentDrivers(segment);
@@ -4183,6 +4306,15 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                     segment?.score_peak != null
                                         ? (() => { const s = Number(segment.score_peak); return s >= 0.1 ? s.toFixed(2) : s < 0.001 ? s.toExponential(2) : s.toFixed(4); })()
                                         : null;
+                                const detSrc = segment?.detection_source || "ai";
+                                const srcBadge =
+                                    detSrc === "both"
+                                        ? { label: "AI + Rule", cls: "bg-rose-100 text-rose-700 border border-rose-200" }
+                                        : detSrc === "rules"
+                                        ? { label: "Rule", cls: "bg-purple-100 text-purple-700 border border-purple-200" }
+                                        : { label: "AI", cls: "bg-blue-100 text-blue-700 border border-blue-200" };
+                                // First rule finding for inline description
+                                const firstRule = segment?.rule_findings?.[0] ?? (detSrc === "rules" ? segment : null);
 
                                 return (
                                     <div
@@ -4200,6 +4332,10 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                         className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${severityTone.badge}`}
                                                     >
                                                         {severity}
+                                                    </span>
+                                                    {/* Task 10 — source badge */}
+                                                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${srcBadge.cls}`}>
+                                                        {srcBadge.label}
                                                     </span>
                                                     {phaseLabel && (
                                                         <span className="text-xs font-medium text-gray-500">
@@ -4243,6 +4379,20 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                                 </span>
                                                             );
                                                         })}
+                                                    </p>
+                                                )}
+                                                {/* Task 10 — rule description line */}
+                                                {firstRule && (
+                                                    <p className="text-xs text-purple-700 font-medium">
+                                                        {firstRule.rule_name}
+                                                        {firstRule.peak_value != null && firstRule.parameter && (
+                                                            <span className="font-normal text-purple-600">
+                                                                {" — "}
+                                                                {firstRule.parameter} reached{" "}
+                                                                {Number(firstRule.peak_value).toFixed(1)}
+                                                                {" "}(limit: {firstRule.threshold})
+                                                            </span>
+                                                        )}
                                                     </p>
                                                 )}
                                                 <p
@@ -4471,7 +4621,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             })
                         ) : (
                             <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-4 py-6 text-center text-sm text-gray-500">
-                                {severityFilter === "all"
+                                {detectionMethodFilter !== "all"
+                                    ? `No ${detectionMethodFilter === "both" ? "confirmed-by-both" : detectionMethodFilter}-method findings${severityFilter !== "all" ? ` at ${severityFilter} severity` : ""}.`
+                                    : severityFilter === "all"
                                     ? "No segments returned for this run."
                                     : `No ${severityFilter}-severity segments found.`}
                             </div>
@@ -4485,6 +4637,89 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         )}
                     </div>
                 </section>
+
+                {/* Task 10 — Rules checked section */}
+                {(() => {
+                    const rulesChecked = rulesResult?.rules_checked || [];
+                    const rulesFailed = rulesResult === null && anomalyResult !== null;
+                    if (!rulesFailed && rulesChecked.length === 0) return null;
+
+                    const checkedCount = rulesChecked.filter((r) => r.status === "checked").length;
+                    const skippedCount = rulesChecked.filter((r) => r.status === "skipped").length;
+                    const findingsCount = rulesChecked.reduce((sum, r) => sum + (r.findings_count || 0), 0);
+
+                    return (
+                        <section className="rounded-xl border border-gray-200 bg-white shadow-sm">
+                            <button
+                                type="button"
+                                onClick={() => setRulesCheckedOpen((v) => !v)}
+                                className="flex w-full items-center justify-between px-5 py-3.5 text-left"
+                            >
+                                <div className="flex items-center gap-2.5">
+                                    <span className="text-sm font-semibold text-gray-800">
+                                        Rules checked
+                                    </span>
+                                    <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500">
+                                        {checkedCount} checked · {skippedCount} skipped · {findingsCount} finding{findingsCount !== 1 ? "s" : ""}
+                                    </span>
+                                </div>
+                                <span className="text-xs text-gray-400">{rulesCheckedOpen ? "▲" : "▼"}</span>
+                            </button>
+
+                            {rulesCheckedOpen && (
+                                <div className="border-t border-gray-100 px-5 pb-4 pt-3 space-y-1">
+                                    {rulesFailed ? (
+                                        <p className="text-xs text-amber-600 font-medium">
+                                            ⚠ Rule-based detection unavailable for this file format
+                                        </p>
+                                    ) : (
+                                        <>
+                                            <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-4 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+                                                <span>Rule</span>
+                                                <span className="text-right">Parameter</span>
+                                                <span className="text-right">Threshold</span>
+                                                <span className="text-right">Findings</span>
+                                            </div>
+                                            {rulesChecked.map((r) => (
+                                                <div
+                                                    key={r.rule_id}
+                                                    className="grid grid-cols-[1fr_auto_auto_auto] gap-x-4 py-1 text-xs border-b border-gray-50 last:border-0"
+                                                >
+                                                    <span className="text-gray-700 font-medium">
+                                                        {r.rule_name}
+                                                    </span>
+                                                    <span className="text-right text-gray-500 max-w-[140px] truncate">
+                                                        {r.status === "skipped" ? (
+                                                            <span className="text-amber-500 italic" title={r.reason}>
+                                                                not found
+                                                            </span>
+                                                        ) : (
+                                                            r.parameter || "—"
+                                                        )}
+                                                    </span>
+                                                    <span className="text-right font-mono text-gray-400">
+                                                        {r.threshold != null ? r.threshold : "—"}
+                                                    </span>
+                                                    <span
+                                                        className={`text-right font-semibold ${
+                                                            r.status === "skipped"
+                                                                ? "text-gray-300"
+                                                                : r.findings_count > 0
+                                                                ? "text-purple-600"
+                                                                : "text-gray-400"
+                                                        }`}
+                                                    >
+                                                        {r.status === "skipped" ? "—" : r.findings_count}
+                                                    </span>
+                                                </div>
+                                            ))}
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                        </section>
+                    );
+                })()}
 
                 <section className="rounded-3xl bg-white p-6 border border-gray-200">
                     <h2 className="text-lg font-semibold text-gray-900">Notes</h2>
