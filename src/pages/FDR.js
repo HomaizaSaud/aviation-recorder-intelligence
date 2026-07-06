@@ -5307,14 +5307,53 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         >
                             Change case
                         </button>
-                        <button
-                            type="button"
-                            onClick={handleRunDetection}
-                            disabled={isRunningDetection || availableParameters.length === 0}
-                            className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
-                        >
-                            {isRunningDetection ? "Running..." : "Run Analysis"}
-                        </button>
+                        {/* State-aware analysis button */}
+                        {isRunningDetection ? (
+                            <button
+                                type="button"
+                                disabled
+                                className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-xs font-semibold text-gray-400 cursor-not-allowed"
+                            >
+                                <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                </svg>
+                                Running...
+                            </button>
+                        ) : anomalyResult && workflowStage === 'analysis' ? (
+                            <div className="flex flex-col items-end gap-0.5">
+                                <button
+                                    type="button"
+                                    onClick={() => setWorkflowStage('results')}
+                                    className="inline-flex items-center gap-2 rounded-lg border border-emerald-500 px-4 py-2 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-50"
+                                >
+                                    View Results
+                                </button>
+                                {analysisTimestamp && (
+                                    <span className="text-[11px] text-gray-400">
+                                        Last run: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
+                                    </span>
+                                )}
+                            </div>
+                        ) : anomalyResult && workflowStage === 'results' ? (
+                            <button
+                                type="button"
+                                onClick={handleRunDetection}
+                                disabled={availableParameters.length === 0}
+                                className="inline-flex items-center gap-2 rounded-lg border border-emerald-500 px-4 py-2 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                Re-run Analysis
+                            </button>
+                        ) : (
+                            <button
+                                type="button"
+                                onClick={handleRunDetection}
+                                disabled={availableParameters.length === 0}
+                                className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
+                            >
+                                Run Analysis
+                            </button>
+                        )}
                     </div>
                 </div>
             </header>
@@ -5382,15 +5421,6 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             </div>
                         )}
 
-                        {anomalyResult && (
-                            <button
-                                type="button"
-                                onClick={() => setWorkflowStage("results")}
-                                className="w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 transition"
-                            >
-                                View Analysis Results →
-                            </button>
-                        )}
                     </div>
                 )}
             </section>
