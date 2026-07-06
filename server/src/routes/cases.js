@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const { detectEmotionForCase } = require('../services/emotion');
 const {
   listCases,
@@ -33,7 +34,7 @@ const {
   deleteNote,
 } = require('../services/notes');
 const { analyzeFdrForCase, segmentFlightsForCase, detectPhasesForCase, detectRulesForCase } = require('../services/anomaly');
-const { getFdrOccurrence, setFdrOccurrence } = require('../services/cases');
+const { getFdrOccurrence, setFdrOccurrence, getFdrCorrections, addFdrCorrection, deleteFdrCorrection } = require('../services/cases');
 const {
   denoiseCvrForCase,
   resolveDenoiseOutputPath,
@@ -144,6 +145,57 @@ router.patch('/:caseNumber/fdr/occurrence', async (req, res, next) => {
       end: end == null ? null : Number(end),
       label: label == null ? null : String(label),
     });
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/:caseNumber/fdr/corrections', async (req, res, next) => {
+  try {
+    const result = await getFdrCorrections(req.params.caseNumber);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/corrections', async (req, res, next) => {
+  try {
+    const correction = req.body || {};
+    const note = typeof correction.note === 'string' ? correction.note.trim() : '';
+    if (note.length < 10) {
+      return res.status(400).json({ error: 'Note must be at least 10 characters.' });
+    }
+    const entry = {
+      id: correction.id || crypto.randomUUID(),
+      type: correction.type || 'false_positive',
+      target_id: String(correction.target_id ?? ''),
+      original_value: correction.original_value ?? {},
+      corrected_value: correction.corrected_value ?? {},
+      investigator: String(correction.investigator ?? 'investigator'),
+      timestamp: correction.timestamp || new Date().toISOString(),
+      note,
+    };
+    const result = await addFdrCorrection(req.params.caseNumber, entry);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete('/:caseNumber/fdr/corrections/:correctionId', async (req, res, next) => {
+  try {
+    const result = await deleteFdrCorrection(req.params.caseNumber, req.params.correctionId);
     if (result === null) {
       return res.status(404).json({ error: 'Case not found' });
     }

@@ -17,7 +17,7 @@ import {
 } from "recharts";
 import NotesPanel from "../components/NotesPanel";
 import { fetchCaseByNumber, updateCase } from "../api/cases";
-import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence, fetchFdrRules } from "../api/anomaly";
+import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence, fetchFdrRules, fetchFdrCorrections, addFdrCorrection, deleteFdrCorrection } from "../api/anomaly";
 import { useAuth } from "../hooks/useAuth";
 import useRecentCases from "../hooks/useRecentCases";
 import { buildCasePreview } from "../utils/caseDisplay";
@@ -1056,6 +1056,14 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [rulesWasAttempted, setRulesWasAttempted] = useState(false);
     const [detectionMethodFilter, setDetectionMethodFilter] = useState("all");
     const [rulesCheckedOpen, setRulesCheckedOpen] = useState(false);
+    const [corrections, setCorrections] = useState([]);
+    const [correctionForms, setCorrectionForms] = useState({});
+    const [correctionsLogOpen, setCorrectionsLogOpen] = useState(false);
+    const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+    const [dismissedOpen, setDismissedOpen] = useState(false);
+    const [phaseEditMode, setPhaseEditMode] = useState(false);
+    const [phaseCorrectionForm, setPhaseCorrectionForm] = useState({});
+    const [phaseEditNote, setPhaseEditNote] = useState('');
     const [isLoadingFdrData, setIsLoadingFdrData] = useState(false);
     const [fdrDataError, setFdrDataError] = useState("");
     const [caseSummaryCopied, setCaseSummaryCopied] = useState(false);
@@ -1564,6 +1572,17 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 }
             })
             .catch(() => setOccurrenceWindow(null));
+    }, [caseNumber]);
+
+    // Auto-load saved corrections when a case opens.
+    useEffect(() => {
+        if (!caseNumber) {
+            setCorrections([]);
+            return;
+        }
+        fetchFdrCorrections(caseNumber)
+            .then((result) => setCorrections(Array.isArray(result) ? result : []))
+            .catch(() => setCorrections([]));
     }, [caseNumber]);
 
     // Global mouseup listener — captures drag release even when mouse leaves chart.
@@ -2617,6 +2636,76 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         [caseNumber, getSegmentPhaseLabel]
     );
 
+    const investigatorName = useMemo(
+        () => user?.email ?? user?.name ?? selectedCase?.source?.examiner ?? selectedCase?.source?.owner ?? "investigator",
+        [user, selectedCase]
+    );
+
+    const handleSaveCorrection = useCallback(
+        async (segmentKey, segment, type, values) => {
+            const correction = {
+                id: crypto.randomUUID(),
+                type,
+                target_id: String(segment?.start_time ?? ''),
+                original_value: { severity: segment?.severity },
+                corrected_value: type === 'false_positive' ? { dismissed: true } : { severity: values.severity },
+                investigator: investigatorName,
+                timestamp: new Date().toISOString(),
+                note: values.note,
+            };
+            try {
+                const updated = await addFdrCorrection(caseNumber, correction);
+                setCorrections(Array.isArray(updated) ? updated : []);
+                setCorrectionForms((prev) => {
+                    const next = { ...prev };
+                    delete next[segmentKey];
+                    return next;
+                });
+            } catch (err) {
+                console.error('Failed to save correction:', err);
+            }
+        },
+        [caseNumber, investigatorName]
+    );
+
+    const handleSavePhaseCorrections = useCallback(async () => {
+        const changed = Object.entries(phaseCorrectionForm).filter(([phase, newLabel]) => newLabel && newLabel !== phase);
+        if (changed.length === 0 || phaseEditNote.trim().length < 10) return;
+        try {
+            let lastUpdated = corrections;
+            for (const [phase, newLabel] of changed) {
+                const correction = {
+                    id: crypto.randomUUID(),
+                    type: 'phase_correction',
+                    target_id: phase,
+                    original_value: { phase },
+                    corrected_value: { phase: newLabel },
+                    investigator: investigatorName,
+                    timestamp: new Date().toISOString(),
+                    note: phaseEditNote.trim(),
+                };
+                const updated = await addFdrCorrection(caseNumber, correction);
+                if (Array.isArray(updated)) lastUpdated = updated;
+            }
+            setCorrections(lastUpdated);
+            setPhaseEditMode(false);
+            setPhaseCorrectionForm({});
+            setPhaseEditNote('');
+        } catch (err) {
+            console.error('Failed to save phase corrections:', err);
+        }
+    }, [phaseCorrectionForm, phaseEditNote, caseNumber, investigatorName, corrections]);
+
+    const handleDeleteCorrection = useCallback(async (correctionId) => {
+        try {
+            const updated = await deleteFdrCorrection(caseNumber, correctionId);
+            setCorrections(Array.isArray(updated) ? updated : []);
+            setDeleteConfirmId(null);
+        } catch (err) {
+            console.error('Failed to delete correction:', err);
+        }
+    }, [caseNumber]);
+
     const extraSegmentsOmitted = anomalyResult?.summary?.extra_segments_omitted ?? 0;
 
     // Task 10 — merge AI segments with rule-based findings.
@@ -2684,6 +2773,20 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         }
         return result;
     }, [mergedSegments, severityFilter, detectionMethodFilter]);
+
+    // Task 15 — split filteredSegments into active (not dismissed) and dismissed.
+    const activeSegments = useMemo(
+        () => filteredSegments.filter(
+            (seg) => !corrections.some((c) => c.type === 'false_positive' && c.target_id === String(seg?.start_time ?? ''))
+        ),
+        [filteredSegments, corrections]
+    );
+    const dismissedSegments = useMemo(
+        () => filteredSegments.filter(
+            (seg) => corrections.some((c) => c.type === 'false_positive' && c.target_id === String(seg?.start_time ?? ''))
+        ),
+        [filteredSegments, corrections]
+    );
 
     useEffect(() => {
         if (!pendingScrollToChartsRef.current) return;
@@ -2757,6 +2860,14 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         setRulesWasAttempted(false);
         setDetectionMethodFilter("all");
         setRulesCheckedOpen(false);
+        setCorrections([]);
+        setCorrectionForms({});
+        setCorrectionsLogOpen(false);
+        setDeleteConfirmId(null);
+        setDismissedOpen(false);
+        setPhaseEditMode(false);
+        setPhaseCorrectionForm({});
+        setPhaseEditNote('');
     }, [caseNumber]);
 
     // Default correlation param selection: prefer keyword-derived suggestions, then
@@ -4309,8 +4420,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     )}
 
                     <div className="space-y-3">
-                        {filteredSegments.length > 0 ? (
-                            filteredSegments.map((segment, index) => {
+                        {activeSegments.length > 0 ? (
+                            activeSegments.map((segment, index) => {
 
                                 const segmentKey = `${segment?.start_time ?? "seg"}-${index}`;
                                 const isExpanded = expandedSegments.has(segmentKey);
@@ -4336,6 +4447,12 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         : { label: "AI", cls: "bg-blue-100 text-blue-700 border border-blue-200" };
                                 // First rule finding for inline description
                                 const firstRule = segment?.rule_findings?.[0] ?? (detSrc === "rules" ? segment : null);
+                                // Task 15 — correction state for this segment
+                                const corrTargetId = String(segment?.start_time ?? '');
+                                const sevCorrection = corrections.find((c) => c.type === 'severity_adjustment' && c.target_id === corrTargetId);
+                                const effectiveSeverity = sevCorrection?.corrected_value?.severity ?? segment?.severity;
+                                const effectiveSeverityTone = getSeverityTone(effectiveSeverity);
+                                const corrForm = correctionForms[segmentKey] || {};
 
                                 return (
                                     <div
@@ -4350,10 +4467,15 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                             >
                                                 <div className="flex flex-wrap items-center gap-2">
                                                     <span
-                                                        className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${severityTone.badge}`}
+                                                        className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${effectiveSeverityTone.badge}`}
                                                     >
-                                                        {severity}
+                                                        {formatSeverityLabel(effectiveSeverity)}
                                                     </span>
+                                                    {sevCorrection && (
+                                                        <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-600">
+                                                            edited
+                                                        </span>
+                                                    )}
                                                     {/* Task 10 — source badge */}
                                                     <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${srcBadge.cls}`}>
                                                         {srcBadge.label}
@@ -4431,6 +4553,75 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                 {isExpanded ? "▲" : "▼"}
                                             </button>
                                         </div>
+
+                                        {/* Task 15 — Correction action buttons */}
+                                        {!corrForm.mode && (
+                                            <div className="flex items-center gap-2 px-4 pb-3 -mt-2">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'fp', note: '', severity: '' } }))}
+                                                    className="rounded-full border border-gray-200 px-2.5 py-0.5 text-[11px] text-gray-400 transition hover:border-red-200 hover:text-red-500"
+                                                >
+                                                    ✕ False positive
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'sev', note: '', severity: effectiveSeverity ?? '' } }))}
+                                                    className="rounded-full border border-gray-200 px-2.5 py-0.5 text-[11px] text-gray-400 transition hover:border-amber-200 hover:text-amber-600"
+                                                >
+                                                    ⚡ Adjust severity
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        {/* Task 15 — Inline correction form */}
+                                        {corrForm.mode && (
+                                            <div className="border-t border-gray-100 bg-gray-50 px-4 py-3 space-y-2">
+                                                <p className="text-xs font-semibold text-gray-700">
+                                                    {corrForm.mode === 'fp' ? 'Mark as false positive' : 'Adjust severity'}
+                                                </p>
+                                                {corrForm.mode === 'sev' && (
+                                                    <select
+                                                        value={corrForm.severity}
+                                                        onChange={(e) => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { ...prev[segmentKey], severity: e.target.value } }))}
+                                                        className="rounded-lg border border-gray-200 bg-white px-2 py-1 text-xs"
+                                                    >
+                                                        <option value="high">High</option>
+                                                        <option value="med">Medium</option>
+                                                        <option value="low">Low</option>
+                                                    </select>
+                                                )}
+                                                <textarea
+                                                    value={corrForm.note}
+                                                    onChange={(e) => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { ...prev[segmentKey], note: e.target.value } }))}
+                                                    placeholder={corrForm.mode === 'fp' ? 'Reason this is a false positive…' : 'Reason for severity change…'}
+                                                    className="w-full resize-none rounded-lg border border-gray-200 px-3 py-2 text-xs"
+                                                    rows={2}
+                                                />
+                                                <div className="flex items-center justify-between">
+                                                    <span className={`text-[11px] ${corrForm.note.length >= 10 ? 'text-emerald-600' : 'text-gray-400'}`}>
+                                                        {corrForm.note.length}/10 chars{corrForm.note.length >= 10 ? ' ✓' : ` — ${10 - corrForm.note.length} more needed`}
+                                                    </span>
+                                                    <div className="flex gap-2">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setCorrectionForms((prev) => { const n = { ...prev }; delete n[segmentKey]; return n; })}
+                                                            className="rounded-lg border border-gray-200 px-3 py-1 text-xs text-gray-500 transition hover:bg-gray-100"
+                                                        >
+                                                            Cancel
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            disabled={corrForm.note.length < 10}
+                                                            onClick={() => handleSaveCorrection(segmentKey, segment, corrForm.mode, { note: corrForm.note, severity: corrForm.severity })}
+                                                            className="rounded-lg bg-gray-800 px-3 py-1 text-xs text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
+                                                        >
+                                                            Confirm
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
 
                                         {isExpanded && (
                                             <div
@@ -4752,6 +4943,49 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                             </p>
                         )}
                     </div>
+
+                    {/* Task 15 — Dismissed findings section (above Rules checked) */}
+                    {dismissedSegments.length > 0 && (
+                        <section className="rounded-xl border border-gray-200 bg-white shadow-sm">
+                            <button
+                                type="button"
+                                onClick={() => setDismissedOpen((v) => !v)}
+                                className="flex w-full items-center justify-between px-5 py-3.5 text-left"
+                            >
+                                <div className="flex items-center gap-2.5">
+                                    <span className="text-sm font-semibold text-gray-400">
+                                        Dismissed findings
+                                    </span>
+                                    <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-400">
+                                        {dismissedSegments.length}
+                                    </span>
+                                </div>
+                                <span className="text-xs text-gray-400">{dismissedOpen ? "▲" : "▼"}</span>
+                            </button>
+                            {dismissedOpen && (
+                                <div className="divide-y divide-gray-50 border-t border-gray-100">
+                                    {dismissedSegments.map((seg, di) => {
+                                        const fpCorr = corrections.find((c) => c.type === 'false_positive' && c.target_id === String(seg?.start_time ?? ''));
+                                        const dTone = getSeverityTone(seg?.severity);
+                                        return (
+                                            <div key={`dismissed-${seg?.start_time ?? di}`} className="px-5 py-3 opacity-60">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold line-through ${dTone.badge}`}>
+                                                        {formatSeverityLabel(seg?.severity)}
+                                                    </span>
+                                                    <span className="text-xs text-gray-400 line-through">{formatSegmentTimeRange(seg, di)}</span>
+                                                </div>
+                                                <p className="mt-1 text-[11px] text-gray-400">
+                                                    False positive — {fpCorr?.note}
+                                                    <span className="ml-2 text-gray-300">by {fpCorr?.investigator}</span>
+                                                </p>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </section>
+                    )}
                 </section>
 
                 {/* Task 10 — Rules checked section */}
@@ -4838,6 +5072,95 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         </section>
                     );
                 })()}
+
+                {/* Task 15 — Corrections Log */}
+                {corrections.length > 0 && (
+                    <section className="rounded-xl border border-gray-200 bg-white shadow-sm">
+                        <button
+                            type="button"
+                            onClick={() => setCorrectionsLogOpen((v) => !v)}
+                            className="flex w-full items-center justify-between px-5 py-3.5 text-left"
+                        >
+                            <div className="flex items-center gap-2.5">
+                                <span className="text-sm font-semibold text-gray-800">Corrections Log</span>
+                                <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500">
+                                    {corrections.length} entr{corrections.length !== 1 ? "ies" : "y"}
+                                </span>
+                            </div>
+                            <span className="text-xs text-gray-400">{correctionsLogOpen ? "▲" : "▼"}</span>
+                        </button>
+                        {correctionsLogOpen && (
+                            <div className="border-t border-gray-100 overflow-x-auto">
+                                <table className="w-full text-xs">
+                                    <thead>
+                                        <tr className="border-b border-gray-100 bg-gray-50">
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">Type</th>
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">Target</th>
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">Original → Corrected</th>
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">Note</th>
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">By</th>
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400">When</th>
+                                            <th className="px-4 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-gray-400"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-50">
+                                        {corrections.map((corr) => {
+                                            const typeLabel = corr.type === 'false_positive' ? 'False positive' : corr.type === 'severity_adjustment' ? 'Severity adjusted' : 'Phase correction';
+                                            const originalStr = corr.type === 'false_positive' ? `severity: ${corr.original_value?.severity ?? '—'}` : corr.type === 'severity_adjustment' ? corr.original_value?.severity ?? '—' : corr.original_value?.phase ?? '—';
+                                            const correctedStr = corr.type === 'false_positive' ? 'dismissed' : corr.type === 'severity_adjustment' ? corr.corrected_value?.severity ?? '—' : corr.corrected_value?.phase ?? '—';
+                                            const whenStr = corr.timestamp ? new Date(corr.timestamp).toLocaleDateString() : '—';
+                                            const isConfirming = deleteConfirmId === corr.id;
+                                            return (
+                                                <tr key={corr.id} className="hover:bg-gray-50 transition-colors">
+                                                    <td className="px-4 py-2 font-medium text-gray-700">{typeLabel}</td>
+                                                    <td className="px-4 py-2 font-mono text-gray-500">{corr.target_id || '—'}</td>
+                                                    <td className="px-4 py-2 text-gray-600">
+                                                        <span className="text-gray-400">{originalStr}</span>
+                                                        <span className="mx-1 text-gray-300">→</span>
+                                                        <span className="font-medium text-gray-700">{correctedStr}</span>
+                                                    </td>
+                                                    <td className="px-4 py-2 text-gray-600 max-w-[200px] truncate" title={corr.note}>{corr.note}</td>
+                                                    <td className="px-4 py-2 text-gray-400 max-w-[120px] truncate" title={corr.investigator}>{corr.investigator}</td>
+                                                    <td className="px-4 py-2 text-gray-400 whitespace-nowrap">{whenStr}</td>
+                                                    <td className="px-4 py-2">
+                                                        {isConfirming ? (
+                                                            <div className="flex items-center gap-1">
+                                                                <span className="text-[10px] text-red-600">Sure?</span>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleDeleteCorrection(corr.id)}
+                                                                    className="rounded bg-red-500 px-1.5 py-0.5 text-[10px] text-white hover:bg-red-600 transition"
+                                                                >
+                                                                    Yes
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setDeleteConfirmId(null)}
+                                                                    className="rounded border border-gray-200 px-1.5 py-0.5 text-[10px] text-gray-500 hover:bg-gray-50 transition"
+                                                                >
+                                                                    No
+                                                                </button>
+                                                            </div>
+                                                        ) : (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setDeleteConfirmId(corr.id)}
+                                                                className="text-[10px] text-gray-300 hover:text-red-500 transition"
+                                                                title="Delete this correction"
+                                                            >
+                                                                ✕
+                                                            </button>
+                                                        )}
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </section>
+                )}
 
                 <section className="rounded-3xl bg-white p-6 border border-gray-200">
                     <h2 className="text-lg font-semibold text-gray-900">Notes</h2>
@@ -5203,42 +5526,98 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
                         {/* Phase bar — max 5 solid blocks, 2 px gaps, 36 px tall */}
                         {totalDuration > 0 && (
-                            <div className="flex h-9 w-full gap-0.5">
-                                {groupedPhases.map((p) => {
-                                    const widthPct = (p.duration_s / totalDuration) * 100;
-                                    const isActive = selectedPhaseKey === p.phase;
-                                    const isAnySelected = selectedPhaseKey !== null;
-                                    return (
-                                        <div
-                                            key={p.phase}
-                                            title={`${p.phase} — ${formatPhaseDuration(p.duration_s)}`}
-                                            onClick={() =>
-                                                setSelectedPhaseKey(isActive ? null : p.phase)
-                                            }
-                                            style={{
-                                                width: `${widthPct}%`,
-                                                backgroundColor: PHASE_COLORS[p.phase] || "#94a3b8",
-                                                opacity: isAnySelected
-                                                    ? isActive ? 1 : 0.35
-                                                    : 0.85,
-                                            }}
-                                            className="flex cursor-pointer flex-col items-center justify-center overflow-hidden rounded-md px-1 text-white transition-opacity hover:opacity-100 select-none"
+                            <div className="group relative">
+                                <div className="flex h-9 w-full gap-0.5">
+                                    {groupedPhases.map((p) => {
+                                        const widthPct = (p.duration_s / totalDuration) * 100;
+                                        const isActive = selectedPhaseKey === p.phase;
+                                        const isAnySelected = selectedPhaseKey !== null;
+                                        const hasPhaseCorrection = corrections.some((c) => c.type === 'phase_correction' && c.target_id === p.phase);
+                                        return (
+                                            <div
+                                                key={p.phase}
+                                                title={`${p.phase} — ${formatPhaseDuration(p.duration_s)}`}
+                                                onClick={() => !phaseEditMode && setSelectedPhaseKey(isActive ? null : p.phase)}
+                                                style={{
+                                                    width: `${widthPct}%`,
+                                                    backgroundColor: PHASE_COLORS[p.phase] || "#94a3b8",
+                                                    opacity: isAnySelected && !phaseEditMode
+                                                        ? isActive ? 1 : 0.35
+                                                        : 0.85,
+                                                }}
+                                                className={`relative flex flex-col items-center justify-center overflow-hidden rounded-md px-1 text-white transition-opacity select-none ${phaseEditMode ? 'cursor-default' : 'cursor-pointer hover:opacity-100'}`}
+                                            >
+                                                {phaseEditMode ? (
+                                                    <select
+                                                        value={phaseCorrectionForm[p.phase] ?? p.phase}
+                                                        onClick={(e) => e.stopPropagation()}
+                                                        onChange={(e) => setPhaseCorrectionForm((prev) => ({ ...prev, [p.phase]: e.target.value }))}
+                                                        className="w-full rounded bg-black/20 text-[10px] text-white border-0 outline-none cursor-pointer"
+                                                    >
+                                                        {["TAKEOFF", "CLIMB", "CRUISE", "DESCENT", "LANDING"].map((ph) => (
+                                                            <option key={ph} value={ph} className="text-gray-900 bg-white">{ph}</option>
+                                                        ))}
+                                                    </select>
+                                                ) : (
+                                                    <>
+                                                        {widthPct > 8 && (
+                                                            <span className="truncate text-xs font-bold leading-tight">
+                                                                {widthPct > 14 ? p.phase : p.phase.slice(0, 2)}
+                                                            </span>
+                                                        )}
+                                                        {widthPct > 14 && (
+                                                            <span className="truncate text-[10px] leading-tight opacity-90">
+                                                                {formatPhaseDuration(p.duration_s)}
+                                                            </span>
+                                                        )}
+                                                        {hasPhaseCorrection && (
+                                                            <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-white opacity-80" title="Phase corrected" />
+                                                        )}
+                                                    </>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                                {/* Task 15 — Phase edit toggle button (appears on bar hover) */}
+                                <button
+                                    type="button"
+                                    onClick={() => { setPhaseEditMode((v) => !v); setPhaseCorrectionForm({}); setPhaseEditNote(''); }}
+                                    className={`absolute -right-7 top-1/2 -translate-y-1/2 rounded-full border p-1 text-[11px] transition ${phaseEditMode ? 'border-amber-300 bg-amber-50 text-amber-600' : 'border-gray-200 bg-white text-gray-400 opacity-0 group-hover:opacity-100'}`}
+                                    title={phaseEditMode ? 'Cancel phase edit' : 'Edit phase labels'}
+                                >
+                                    ✏
+                                </button>
+                                {/* Task 15 — Phase edit save row */}
+                                {phaseEditMode && (
+                                    <div className="mt-2 flex items-center gap-2">
+                                        <textarea
+                                            value={phaseEditNote}
+                                            onChange={(e) => setPhaseEditNote(e.target.value)}
+                                            placeholder="Reason for phase relabeling…"
+                                            className="flex-1 resize-none rounded-lg border border-gray-200 px-2 py-1 text-xs"
+                                            rows={1}
+                                        />
+                                        <span className={`whitespace-nowrap text-[11px] ${phaseEditNote.length >= 10 ? 'text-emerald-600' : 'text-gray-400'}`}>
+                                            {phaseEditNote.length}/10{phaseEditNote.length >= 10 ? ' ✓' : ''}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            disabled={phaseEditNote.length < 10}
+                                            onClick={handleSavePhaseCorrections}
+                                            className="rounded-lg bg-gray-800 px-3 py-1 text-xs text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
                                         >
-                                            {widthPct > 8 && (
-                                                <span className="truncate text-xs font-bold leading-tight">
-                                                    {widthPct > 14
-                                                        ? p.phase
-                                                        : p.phase.slice(0, 2)}
-                                                </span>
-                                            )}
-                                            {widthPct > 14 && (
-                                                <span className="truncate text-[10px] leading-tight opacity-90">
-                                                    {formatPhaseDuration(p.duration_s)}
-                                                </span>
-                                            )}
-                                        </div>
-                                    );
-                                })}
+                                            Save
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => { setPhaseEditMode(false); setPhaseCorrectionForm({}); setPhaseEditNote(''); }}
+                                            className="rounded-lg border border-gray-200 px-3 py-1 text-xs text-gray-500 transition hover:bg-gray-50"
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         )}
 

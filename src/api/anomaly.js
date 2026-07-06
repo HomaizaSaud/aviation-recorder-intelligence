@@ -195,6 +195,24 @@ export const fetchFdrRules = async (caseId) => {
   return response;
 };
 
+export const fetchFdrCorrections = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/corrections`, { method: 'GET' });
+  return response;
+};
+
+export const addFdrCorrection = async (caseId, correction) => {
+  const response = await request(`/cases/${caseId}/fdr/corrections`, {
+    method: 'POST',
+    body: JSON.stringify(correction),
+  });
+  return response;
+};
+
+export const deleteFdrCorrection = async (caseId, correctionId) => {
+  const response = await request(`/cases/${caseId}/fdr/corrections/${correctionId}`, { method: 'DELETE' });
+  return response;
+};
+
 export const fetchFdrOccurrence = async (caseId) => {
   const response = await request(`/cases/${caseId}/fdr/occurrence`, {
     method: 'GET',
