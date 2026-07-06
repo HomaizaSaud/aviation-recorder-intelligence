@@ -1060,6 +1060,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [correctionForms, setCorrectionForms] = useState({});
     const [correctionsLogOpen, setCorrectionsLogOpen] = useState(false);
     const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+    const [savedToast, setSavedToast] = useState(null);
     const [dismissedOpen, setDismissedOpen] = useState(false);
     const [phaseEditMode, setPhaseEditMode] = useState(false);
     const [phaseCorrectionForm, setPhaseCorrectionForm] = useState({});
@@ -2648,10 +2649,13 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 type,
                 target_id: String(segment?.start_time ?? ''),
                 original_value: { severity: segment?.severity },
-                corrected_value: type === 'false_positive' ? { dismissed: true } : { severity: values.severity },
+                corrected_value:
+                    type === 'false_positive' ? { dismissed: true }
+                    : type === 'flag'         ? { flag_type: values.flagType }
+                    :                           { severity: values.severity },
                 investigator: investigatorName,
                 timestamp: new Date().toISOString(),
-                note: values.note,
+                note: values.note ?? '',
             };
             try {
                 const updated = await addFdrCorrection(caseNumber, correction);
@@ -2661,6 +2665,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     delete next[segmentKey];
                     return next;
                 });
+                setSavedToast('Saved');
+                setTimeout(() => setSavedToast(null), 2000);
             } catch (err) {
                 console.error('Failed to save correction:', err);
             }
@@ -2670,7 +2676,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
     const handleSavePhaseCorrections = useCallback(async () => {
         const changed = Object.entries(phaseCorrectionForm).filter(([phase, newLabel]) => newLabel && newLabel !== phase);
-        if (changed.length === 0 || phaseEditNote.trim().length < 10) return;
+        if (changed.length === 0) return;
         try {
             let lastUpdated = corrections;
             for (const [phase, newLabel] of changed) {
@@ -2864,6 +2870,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         setCorrectionForms({});
         setCorrectionsLogOpen(false);
         setDeleteConfirmId(null);
+        setSavedToast(null);
         setDismissedOpen(false);
         setPhaseEditMode(false);
         setPhaseCorrectionForm({});
@@ -4453,6 +4460,16 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                 const effectiveSeverity = sevCorrection?.corrected_value?.severity ?? segment?.severity;
                                 const effectiveSeverityTone = getSeverityTone(effectiveSeverity);
                                 const corrForm = correctionForms[segmentKey] || {};
+                                const segmentFlags = corrections.filter((c) => c.type === 'flag' && c.target_id === corrTargetId);
+                                const FLAG_COLORS = {
+                                    caution: 'bg-amber-100 text-amber-700',
+                                    needs_review: 'bg-blue-100 text-blue-700',
+                                    crew_error: 'bg-red-100 text-red-700',
+                                    system_fault: 'bg-orange-100 text-orange-700',
+                                    weather: 'bg-sky-100 text-sky-700',
+                                    atc: 'bg-purple-100 text-purple-700',
+                                    other: 'bg-gray-100 text-gray-600',
+                                };
 
                                 return (
                                     <div
@@ -4538,6 +4555,20 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                         )}
                                                     </p>
                                                 )}
+                                                {segmentFlags.length > 0 && (
+                                                    <div className="flex flex-wrap gap-1 mt-1">
+                                                        {segmentFlags.map((f) => {
+                                                            const ft = f.corrected_value?.flag_type ?? 'other';
+                                                            const colorCls = FLAG_COLORS[ft] ?? FLAG_COLORS.other;
+                                                            const label = ft.replace(/_/g, ' ');
+                                                            return (
+                                                                <span key={f.id} className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${colorCls}`}>
+                                                                    {label}
+                                                                </span>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                )}
                                                 <p
                                                     className={`text-xs font-medium ${severityTone.actionText}`}
                                                 >
@@ -4559,17 +4590,24 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                             <div className="flex items-center gap-2 px-4 pb-3 -mt-2">
                                                 <button
                                                     type="button"
-                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'fp', note: '', severity: '' } }))}
-                                                    className="rounded-full border border-gray-200 px-2.5 py-0.5 text-[11px] text-gray-400 transition hover:border-red-200 hover:text-red-500"
+                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'fp', note: '', severity: '', flagType: '' } }))}
+                                                    className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-500 transition hover:bg-gray-50"
                                                 >
-                                                    ✕ False positive
+                                                    False positive
                                                 </button>
                                                 <button
                                                     type="button"
-                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'sev', note: '', severity: effectiveSeverity ?? '' } }))}
-                                                    className="rounded-full border border-gray-200 px-2.5 py-0.5 text-[11px] text-gray-400 transition hover:border-amber-200 hover:text-amber-600"
+                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'sev', note: '', severity: effectiveSeverity ?? '', flagType: '' } }))}
+                                                    className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-500 transition hover:bg-gray-50"
                                                 >
-                                                    ⚡ Adjust severity
+                                                    Adjust severity
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { mode: 'flag', note: '', severity: '', flagType: 'caution' } }))}
+                                                    className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-500 transition hover:bg-gray-50"
+                                                >
+                                                    Add flag
                                                 </button>
                                             </div>
                                         )}
@@ -4578,7 +4616,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         {corrForm.mode && (
                                             <div className="border-t border-gray-100 bg-gray-50 px-4 py-3 space-y-2">
                                                 <p className="text-xs font-semibold text-gray-700">
-                                                    {corrForm.mode === 'fp' ? 'Mark as false positive' : 'Adjust severity'}
+                                                    {corrForm.mode === 'fp' ? 'Mark as false positive' : corrForm.mode === 'flag' ? 'Add flag' : 'Adjust severity'}
                                                 </p>
                                                 {corrForm.mode === 'sev' && (
                                                     <select
@@ -4591,34 +4629,43 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                         <option value="low">Low</option>
                                                     </select>
                                                 )}
+                                                {corrForm.mode === 'flag' && (
+                                                    <select
+                                                        value={corrForm.flagType}
+                                                        onChange={(e) => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { ...prev[segmentKey], flagType: e.target.value } }))}
+                                                        className="rounded-lg border border-gray-200 bg-white px-2 py-1 text-xs"
+                                                    >
+                                                        <option value="caution">Caution</option>
+                                                        <option value="needs_review">Needs review</option>
+                                                        <option value="crew_error">Crew error</option>
+                                                        <option value="system_fault">System fault</option>
+                                                        <option value="weather">Weather</option>
+                                                        <option value="atc">ATC</option>
+                                                        <option value="other">Other</option>
+                                                    </select>
+                                                )}
                                                 <textarea
                                                     value={corrForm.note}
                                                     onChange={(e) => setCorrectionForms((prev) => ({ ...prev, [segmentKey]: { ...prev[segmentKey], note: e.target.value } }))}
-                                                    placeholder={corrForm.mode === 'fp' ? 'Reason this is a false positive…' : 'Reason for severity change…'}
+                                                    placeholder="Add a note (optional)"
                                                     className="w-full resize-none rounded-lg border border-gray-200 px-3 py-2 text-xs"
                                                     rows={2}
                                                 />
-                                                <div className="flex items-center justify-between">
-                                                    <span className={`text-[11px] ${corrForm.note.length >= 10 ? 'text-emerald-600' : 'text-gray-400'}`}>
-                                                        {corrForm.note.length}/10 chars{corrForm.note.length >= 10 ? ' ✓' : ` — ${10 - corrForm.note.length} more needed`}
-                                                    </span>
-                                                    <div className="flex gap-2">
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => setCorrectionForms((prev) => { const n = { ...prev }; delete n[segmentKey]; return n; })}
-                                                            className="rounded-lg border border-gray-200 px-3 py-1 text-xs text-gray-500 transition hover:bg-gray-100"
-                                                        >
-                                                            Cancel
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            disabled={corrForm.note.length < 10}
-                                                            onClick={() => handleSaveCorrection(segmentKey, segment, corrForm.mode, { note: corrForm.note, severity: corrForm.severity })}
-                                                            className="rounded-lg bg-gray-800 px-3 py-1 text-xs text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
-                                                        >
-                                                            Confirm
-                                                        </button>
-                                                    </div>
+                                                <div className="flex justify-end gap-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setCorrectionForms((prev) => { const n = { ...prev }; delete n[segmentKey]; return n; })}
+                                                        className="rounded-lg border border-gray-200 px-3 py-1 text-xs text-gray-500 transition hover:bg-gray-100"
+                                                    >
+                                                        Cancel
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleSaveCorrection(segmentKey, segment, corrForm.mode, { note: corrForm.note, severity: corrForm.severity, flagType: corrForm.flagType })}
+                                                        className="rounded-lg bg-gray-800 px-3 py-1 text-xs text-white transition hover:bg-gray-700"
+                                                    >
+                                                        Confirm
+                                                    </button>
                                                 </div>
                                             </div>
                                         )}
@@ -4970,13 +5017,13 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         return (
                                             <div key={`dismissed-${seg?.start_time ?? di}`} className="px-5 py-3 opacity-60">
                                                 <div className="flex flex-wrap items-center gap-2">
-                                                    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold line-through ${dTone.badge}`}>
-                                                        {formatSeverityLabel(seg?.severity)}
+                                                    <span className="inline-flex rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-semibold text-gray-400">
+                                                        Dismissed
                                                     </span>
-                                                    <span className="text-xs text-gray-400 line-through">{formatSegmentTimeRange(seg, di)}</span>
+                                                    <span className="text-xs text-gray-400">{formatSegmentTimeRange(seg, di)}</span>
                                                 </div>
                                                 <p className="mt-1 text-[11px] text-gray-400">
-                                                    False positive — {fpCorr?.note}
+                                                    {fpCorr?.note ? `${fpCorr.note} — ` : ''}False positive
                                                     <span className="ml-2 text-gray-300">by {fpCorr?.investigator}</span>
                                                 </p>
                                             </div>
@@ -5105,9 +5152,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                     </thead>
                                     <tbody className="divide-y divide-gray-50">
                                         {corrections.map((corr) => {
-                                            const typeLabel = corr.type === 'false_positive' ? 'False positive' : corr.type === 'severity_adjustment' ? 'Severity adjusted' : 'Phase correction';
-                                            const originalStr = corr.type === 'false_positive' ? `severity: ${corr.original_value?.severity ?? '—'}` : corr.type === 'severity_adjustment' ? corr.original_value?.severity ?? '—' : corr.original_value?.phase ?? '—';
-                                            const correctedStr = corr.type === 'false_positive' ? 'dismissed' : corr.type === 'severity_adjustment' ? corr.corrected_value?.severity ?? '—' : corr.corrected_value?.phase ?? '—';
+                                            const typeLabel = corr.type === 'false_positive' ? 'False positive' : corr.type === 'severity_adjustment' ? 'Severity adjusted' : corr.type === 'flag' ? 'Flag' : 'Phase correction';
+                                            const originalStr = corr.type === 'false_positive' ? `severity: ${corr.original_value?.severity ?? '—'}` : corr.type === 'severity_adjustment' ? corr.original_value?.severity ?? '—' : corr.type === 'flag' ? '—' : corr.original_value?.phase ?? '—';
+                                            const correctedStr = corr.type === 'false_positive' ? 'dismissed' : corr.type === 'severity_adjustment' ? corr.corrected_value?.severity ?? '—' : corr.type === 'flag' ? (corr.corrected_value?.flag_type ?? '—').replace(/_/g, ' ') : corr.corrected_value?.phase ?? '—';
                                             const whenStr = corr.timestamp ? new Date(corr.timestamp).toLocaleDateString() : '—';
                                             const isConfirming = deleteConfirmId === corr.id;
                                             return (
@@ -5174,6 +5221,13 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         emptyMessage="No FDR notes saved yet."
                     />
                 </section>
+
+                {/* Task 15 — Saved toast */}
+                {savedToast && (
+                    <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg">
+                        ✓ Saved
+                    </div>
+                )}
             </div>
         );
     }
@@ -5594,18 +5648,14 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         <textarea
                                             value={phaseEditNote}
                                             onChange={(e) => setPhaseEditNote(e.target.value)}
-                                            placeholder="Reason for phase relabeling…"
+                                            placeholder="Add a note (optional)"
                                             className="flex-1 resize-none rounded-lg border border-gray-200 px-2 py-1 text-xs"
                                             rows={1}
                                         />
-                                        <span className={`whitespace-nowrap text-[11px] ${phaseEditNote.length >= 10 ? 'text-emerald-600' : 'text-gray-400'}`}>
-                                            {phaseEditNote.length}/10{phaseEditNote.length >= 10 ? ' ✓' : ''}
-                                        </span>
                                         <button
                                             type="button"
-                                            disabled={phaseEditNote.length < 10}
                                             onClick={handleSavePhaseCorrections}
-                                            className="rounded-lg bg-gray-800 px-3 py-1 text-xs text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
+                                            className="rounded-lg bg-gray-800 px-3 py-1 text-xs text-white transition hover:bg-gray-700"
                                         >
                                             Save
                                         </button>

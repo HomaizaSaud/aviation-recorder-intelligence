@@ -170,9 +170,6 @@ router.post('/:caseNumber/fdr/corrections', async (req, res, next) => {
   try {
     const correction = req.body || {};
     const note = typeof correction.note === 'string' ? correction.note.trim() : '';
-    if (note.length < 10) {
-      return res.status(400).json({ error: 'Note must be at least 10 characters.' });
-    }
     const entry = {
       id: correction.id || crypto.randomUUID(),
       type: correction.type || 'false_positive',
