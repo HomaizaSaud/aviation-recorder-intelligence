@@ -5292,14 +5292,14 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         detection for the selected flight case.
                     </p>
                 </div>
-                <div className="flex flex-col items-start gap-2 text-left sm:flex-row sm:items-center sm:gap-3 sm:text-right">
-                    <div className="sm:text-right">
+                <div className="flex items-center justify-end gap-4">
+                    <div className="text-right">
                         <p className="text-sm text-gray-500">Active Case</p>
                         <p className="text-sm font-semibold text-gray-800">
                             {selectedCase?.id} · {selectedCase?.title}
                         </p>
                     </div>
-                    <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-2">
                         <button
                             type="button"
                             onClick={handleChangeCase}
@@ -5321,7 +5321,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                 Running...
                             </button>
                         ) : anomalyResult && workflowStage === 'analysis' ? (
-                            <div className="flex flex-col items-end gap-0.5">
+                            <>
                                 <button
                                     type="button"
                                     onClick={() => setWorkflowStage('results')}
@@ -5330,11 +5330,11 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                     View Results
                                 </button>
                                 {analysisTimestamp && (
-                                    <span className="text-[11px] text-gray-400">
+                                    <span className="text-xs text-gray-400 ml-2">
                                         Last run: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
                                     </span>
                                 )}
-                            </div>
+                            </>
                         ) : anomalyResult && workflowStage === 'results' ? (
                             <button
                                 type="button"
