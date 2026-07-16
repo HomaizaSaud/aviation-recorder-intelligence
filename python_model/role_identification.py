@@ -18,17 +18,17 @@ class OllamaRoleIdentifier:
     def __init__(self, model: str = "llama3.2:3b", ollama_url: str = "http://localhost:11434"):
         self.model = model
         self.ollama_url = ollama_url
+        self.ollama_available = False
 
         try:
             response = requests.get(f"{ollama_url}/api/tags", timeout=10)
-            if response.status_code != 200:
-                raise ConnectionError("Cannot connect to Ollama")
+            self.ollama_available = response.status_code == 200
         except Exception as exc:
-            raise ConnectionError(
-                f"Cannot connect to Ollama at {ollama_url}. "
-                f"Make sure Ollama is running: 'ollama serve'\n"
-                f"Error: {exc}"
-            ) from exc
+            print(
+                f"Warning: Cannot connect to Ollama at {ollama_url} ({exc}). "
+                f"Falling back to keyword-based role classification.",
+                flush=True,
+            )
 
     def identify_roles(self, utterances: List[Dict]) -> Dict[str, str]:
         speaker_utterances = {}
@@ -37,6 +37,9 @@ class OllamaRoleIdentifier:
             if speaker not in speaker_utterances:
                 speaker_utterances[speaker] = []
             speaker_utterances[speaker].append(utt["text"])
+
+        if not self.ollama_available:
+            return self._fallback_classification(speaker_utterances)
 
         conversation_text = self._format_conversation(speaker_utterances)
         prompt = f"""You are an aviation expert analyzing cockpit voice recorder (CVR) transcripts.

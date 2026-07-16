@@ -23,6 +23,10 @@ const attachmentHasData = (attachments = [], targetType) =>
       return false;
     }
 
+    if (attachment.missingInStorage) {
+      return false;
+    }
+
     if (normalize(attachment.type) !== normalize(targetType)) {
       return false;
     }

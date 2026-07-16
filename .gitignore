@@ -83,3 +83,7 @@ docs/Data_Samples/*.csv
 # MinIO data
 data/
 minio.exe
+
+# Local database dumps (may contain real user data) - schema migrations in server/db/ stay tracked
+/*_import.sql
+/*_dump.sql

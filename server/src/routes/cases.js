@@ -39,6 +39,7 @@ const {
   transcribeCvrForCase,
   identifyCvrRolesForCase,
   detectCvrEventsForCase,
+  separateCvrChannelsForCase,
   deleteDenoiseOutputForCase,
 } = require('../services/cvr');
 const { validateCasePayload } = require('../utils/validate-case');
@@ -386,6 +387,15 @@ router.post('/:caseNumber/cvr/roles', async (req, res, next) => {
 router.post('/:caseNumber/cvr/events', async (req, res, next) => {
   try {
     const result = await detectCvrEventsForCase(req.params.caseNumber, { ...(req.body || {}), user: req.user });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/cvr/channels', async (req, res, next) => {
+  try {
+    const result = await separateCvrChannelsForCase(req.params.caseNumber, { ...(req.body || {}), user: req.user });
     res.json(result);
   } catch (error) {
     next(error);

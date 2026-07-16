@@ -56,6 +56,10 @@ const attachmentHasData = (attachments = [], targetType) =>
       return false;
     }
 
+    if (attachment.missingInStorage) {
+      return false;
+    }
+
     const type = normalize(attachment.type);
     if (type !== normalize(targetType)) {
       return false;
@@ -79,6 +83,10 @@ const attachmentHasData = (attachments = [], targetType) =>
 
 const attachmentEntryHasData = (attachment) => {
   if (!attachment || typeof attachment !== 'object') {
+    return false;
+  }
+
+  if (attachment.missingInStorage) {
     return false;
   }
 

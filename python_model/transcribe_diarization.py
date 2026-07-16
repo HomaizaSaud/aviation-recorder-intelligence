@@ -99,7 +99,19 @@ class DiarizedTranscriber:
 
         print("  Running diarization...")
         audio_input = {"waveform": waveform, "sample_rate": sample_rate}
-        diarization = self.diar_pipeline(audio_input)
+        try:
+            diarization = self.diar_pipeline(audio_input)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            is_gpu_issue = self.device == "cuda" and (
+                "cuda" in message or "nvrtc" in message or "cudnn" in message
+            )
+            if not is_gpu_issue:
+                raise
+            print(f"  GPU diarization failed ({exc}); retrying on CPU...")
+            self.diar_pipeline.to(torch.device("cpu"))
+            self.device = "cpu"
+            diarization = self.diar_pipeline(audio_input)
 
         speaker_segments = []
 

@@ -27,6 +27,10 @@ const matchesType = (attachment, type) => {
 };
 
 const isAttachmentReady = (attachment) => {
+  if (attachment?.missingInStorage) {
+    return false;
+  }
+
   const status = normalizeString(attachment?.status).toLowerCase();
   if (status === 'pending') {
     return false;

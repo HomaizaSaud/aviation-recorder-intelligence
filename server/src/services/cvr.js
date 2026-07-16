@@ -17,10 +17,11 @@ const TRANSCRIBE_DIARIZE_SCRIPT = path.resolve(
 );
 const EVENT_SCRIPT = path.resolve(__dirname, '../../..', 'python_model', 'event_detection.py');
 const ROLE_SCRIPT = path.resolve(__dirname, '../../..', 'python_model', 'role_identification.py');
+const CHANNEL_SEPARATION_SCRIPT = path.resolve(__dirname, '../../..', 'python_model', 'channel_separation.py');
 const OUTPUT_ROOT = path.resolve(__dirname, '../../cvr_outputs');
 const OUTPUT_BUCKET = process.env.MINIO_BUCKET || 'fdr-cvr-data';
 
-const CVR_STEP_NAMES = ['events', 'denoise', 'transcription', 'roles', 'emotion'];
+const CVR_STEP_NAMES = ['events', 'denoise', 'channels', 'transcription', 'roles', 'emotion'];
 
 const buildOutputPrefix = ({ caseId, caseNumber, runId }) => {
   const safeCaseId = String(caseId || caseNumber || 'unknown').replace(/[^a-zA-Z0-9-_]/g, '_');
@@ -36,6 +37,22 @@ const buildCaseCvrPrefix = (caseNumber) => {
   return `cases/${safeCaseNumber}/cvr`;
 };
 const execFileAsync = promisify(execFile);
+
+// Conda envs put CUDA DLLs (e.g. nvrtc-builtins) in dirs that are only on PATH
+// after `conda activate`. We spawn python.exe directly, so add them ourselves.
+const PYTHON_ENV_DIR = path.dirname(PYTHON_BIN);
+const PYTHON_DLL_DIRS = [
+  PYTHON_ENV_DIR,
+  path.join(PYTHON_ENV_DIR, 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Library', 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Library', 'mingw-w64', 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Library', 'usr', 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Scripts'),
+];
+const buildPythonSpawnEnv = () => ({
+  ...process.env,
+  PATH: [...PYTHON_DLL_DIRS, process.env.PATH].join(path.delimiter),
+});
 
 const normalizeMethod = (value) => {
   const normalized = String(value || '').trim().toLowerCase();
@@ -122,8 +139,8 @@ const loadOriginalAudioBuffer = async (caseNumber, attachment) => {
     try {
       return await fs.readFile(cachePath);
     } catch (error) {
-      const wrapped = new Error('Unable to access CVR audio from object storage or local cache.');
-      wrapped.status = 502;
+      const wrapped = new Error('CVR audio file not found. Please re-upload the file.');
+      wrapped.status = 404;
       wrapped.cause = error;
       throw wrapped;
     }
@@ -231,7 +248,7 @@ const runPythonDenoise = async ({ inputPath, outputPath, method }) => {
     await execFileAsync(
       PYTHON_BIN,
       [PYTHON_SCRIPT, '--input', inputPath, '--output', outputPath, '--method', method],
-      { timeout: 1000 * 60 * 20 },
+      { timeout: 1000 * 60 * 20, env: buildPythonSpawnEnv() },
     );
   } catch (error) {
     const stderr = error?.stderr ? String(error.stderr) : '';
@@ -263,7 +280,8 @@ const formatPythonErrorMessage = (rawMessage = '') => {
     lines.find((line) => line.includes('Exception')) ||
     lines.find((line) => line.toLowerCase().includes('error'));
   if (errorLine) {
-    return errorLine.replace(/^RuntimeError:\s*/, '');
+    const cleaned = errorLine.replace(/^RuntimeError:\s*/, '').trim();
+    return cleaned || 'Transcription failed.';
   }
   const tracebackIndex = rawMessage.lastIndexOf('Traceback');
   if (tracebackIndex !== -1) {
@@ -294,9 +312,12 @@ const runPythonTranscription = async ({
   if (useTimestamps === false) {
     args.push('--no-timestamps');
   }
+  if (process.env.DIARIZATION_DEVICE) {
+    args.push('--device', process.env.DIARIZATION_DEVICE);
+  }
 
   try {
-    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 60 });
+    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 60, env: buildPythonSpawnEnv() });
   } catch (error) {
     const stderr = error?.stderr ? String(error.stderr) : '';
     const stdout = error?.stdout ? String(error.stdout) : '';
@@ -398,7 +419,22 @@ const denoiseCvrForCase = async (caseNumber, options = {}) => {
   const user = options.user;
   const runningPersist = await persistStepRunning({ caseData, stepName: 'denoise', runId, startedAt, user });
   const pipelineCaseData = runningPersist.caseData || caseData;
-  const fileBuffer = await loadOriginalAudioBuffer(caseNumber, cvrAttachment);
+  let fileBuffer;
+  try {
+    fileBuffer = await loadOriginalAudioBuffer(caseNumber, cvrAttachment);
+  } catch (error) {
+    await persistStepFailure({
+      caseData: pipelineCaseData,
+      stepName: 'denoise',
+      runId,
+      startedAt,
+      error: new Error('missing_file'),
+      user,
+    });
+    const wrapped = new Error('CVR audio file not found. Please re-upload the file.');
+    wrapped.status = 404;
+    throw wrapped;
+  }
 
   const extension = path.extname(cvrAttachment.storage.objectKey || '') || '.wav';
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cvr-denoise-'));
@@ -580,7 +616,21 @@ const transcribeCvrForCase = async (caseNumber, options = {}) => {
   if (!fileBuffer) {
     if (inputTarget.source === 'original') {
       const attachment = resolveSourceAttachment(pipelineCaseData, options.sourceObjectKey);
-      fileBuffer = await loadOriginalAudioBuffer(caseNumber, attachment);
+      try {
+        fileBuffer = await loadOriginalAudioBuffer(caseNumber, attachment);
+      } catch (error) {
+        await persistStepFailure({
+          caseData: pipelineCaseData,
+          stepName: 'transcription',
+          runId,
+          startedAt,
+          error: new Error('missing_file'),
+          user,
+        });
+        const wrapped = new Error('CVR audio file not found. Please re-upload the file.');
+        wrapped.status = 404;
+        throw wrapped;
+      }
     } else {
       try {
         fileBuffer = await downloadObjectAsBuffer({
@@ -719,7 +769,7 @@ const runPythonRoleIdentification = async ({ inputPath, outputPath, model, ollam
   }
 
   try {
-    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 10 });
+    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 10, env: buildPythonSpawnEnv() });
   } catch (error) {
     const stderr = error?.stderr ? String(error.stderr) : '';
     const stdout = error?.stdout ? String(error.stdout) : '';
@@ -743,7 +793,32 @@ const runPythonEventDetection = async ({ inputPath, outputPath, methods, thresho
   }
 
   try {
-    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 20 });
+    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 20, env: buildPythonSpawnEnv() });
+  } catch (error) {
+    const stderr = error?.stderr ? String(error.stderr) : '';
+    const stdout = error?.stdout ? String(error.stdout) : '';
+    const message = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n');
+    if (message) {
+      const pythonError = new Error(formatPythonErrorMessage(message));
+      pythonError.status = 400;
+      throw pythonError;
+    }
+    throw error;
+  }
+};
+
+const runPythonChannelSeparation = async ({ inputPath, outputDir, manifestPath }) => {
+  const args = [
+    CHANNEL_SEPARATION_SCRIPT,
+    inputPath,
+    '--output-dir',
+    outputDir,
+    '--manifest',
+    manifestPath,
+  ];
+
+  try {
+    await execFileAsync(PYTHON_BIN, args, { timeout: 1000 * 60 * 20, env: buildPythonSpawnEnv() });
   } catch (error) {
     const stderr = error?.stderr ? String(error.stderr) : '';
     const stdout = error?.stdout ? String(error.stdout) : '';
@@ -938,7 +1013,22 @@ const detectCvrEventsForCase = async (caseNumber, options = {}) => {
   const user = options.user;
   const runningPersist = await persistStepRunning({ caseData, stepName: 'events', runId, startedAt, user });
   const pipelineCaseData = runningPersist.caseData || caseData;
-  const fileBuffer = await loadOriginalAudioBuffer(caseNumber, cvrAttachment);
+  let fileBuffer;
+  try {
+    fileBuffer = await loadOriginalAudioBuffer(caseNumber, cvrAttachment);
+  } catch (error) {
+    await persistStepFailure({
+      caseData: pipelineCaseData,
+      stepName: 'events',
+      runId,
+      startedAt,
+      error: new Error('missing_file'),
+      user,
+    });
+    const wrapped = new Error('CVR audio file not found. Please re-upload the file.');
+    wrapped.status = 404;
+    throw wrapped;
+  }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cvr-events-'));
   const tempInputPath = path.join(tempDir, 'cvr-input.wav');
@@ -1004,6 +1094,123 @@ const detectCvrEventsForCase = async (caseNumber, options = {}) => {
   }
 };
 
+const buildChannelSeparationPrefix = (caseNumber) => {
+  const safeCaseNumber = String(caseNumber || 'unknown').replace(/[^a-zA-Z0-9-_]/g, '_');
+  return `cases/${safeCaseNumber}/cvr/channels`;
+};
+
+const separateCvrChannelsForCase = async (caseNumber, options = {}) => {
+  const caseData = await findCaseByNumber(caseNumber);
+  if (!caseData) {
+    const error = new Error('Case not found');
+    error.status = 404;
+    throw error;
+  }
+
+  const cvrAttachment = resolveSourceAttachment(caseData, options.sourceObjectKey);
+  const startedAt = new Date().toISOString();
+  const runId = buildRunId(options.runId || caseData?.analyses?.cvr?.pipeline?.runId);
+  const user = options.user;
+  const runningPersist = await persistStepRunning({ caseData, stepName: 'channels', runId, startedAt, user });
+  const pipelineCaseData = runningPersist.caseData || caseData;
+  let fileBuffer;
+  try {
+    fileBuffer = await loadOriginalAudioBuffer(caseNumber, cvrAttachment);
+  } catch (error) {
+    await persistStepFailure({
+      caseData: pipelineCaseData,
+      stepName: 'channels',
+      runId,
+      startedAt,
+      error: new Error('missing_file'),
+      user,
+    });
+    const wrapped = new Error('CVR audio file not found. Please re-upload the file.');
+    wrapped.status = 404;
+    throw wrapped;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cvr-channels-'));
+  const tempInputPath = path.join(tempDir, 'cvr-input.wav');
+  const tempOutputDir = path.join(tempDir, 'clips');
+  const manifestPath = path.join(tempDir, 'manifest.json');
+  const outputDir = await ensureOutputDirectory(caseNumber, runId, 'channels');
+  const outputPrefix = buildChannelSeparationPrefix(caseNumber);
+
+  try {
+    await fs.writeFile(tempInputPath, fileBuffer);
+    await runPythonChannelSeparation({
+      inputPath: tempInputPath,
+      outputDir: tempOutputDir,
+      manifestPath,
+    });
+
+    const manifestRaw = await fs.readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(manifestRaw);
+    const rawChannels = Array.isArray(manifest.channels) ? manifest.channels : [];
+
+    const channels = [];
+    for (const channel of rawChannels) {
+      const clipPath = path.join(tempOutputDir, channel.filename);
+      const clipBuffer = await fs.readFile(clipPath);
+      const persistedClipPath = path.join(outputDir, channel.filename);
+      await fs.writeFile(persistedClipPath, clipBuffer);
+
+      const objectKey = `${outputPrefix}/${channel.filename}`;
+      const uploaded = await uploadObjectBuffer({
+        bucket: OUTPUT_BUCKET,
+        objectKey,
+        body: clipBuffer,
+        contentType: 'audio/wav',
+      });
+      const presigned = await createPresignedDownload({
+        bucket: uploaded.bucket,
+        objectKey: uploaded.objectKey,
+        fileName: channel.filename,
+        contentType: 'audio/wav',
+      });
+
+      channels.push({
+        speaker: channel.speaker,
+        duration: channel.duration,
+        segments: channel.segments,
+        storage: uploaded,
+        downloadUrl: presigned.downloadUrl,
+      });
+    }
+
+    const completedAt = new Date().toISOString();
+    const output = {
+      caseNumber,
+      runId,
+      channels,
+      summaryStats: {
+        speakerCount: channels.length,
+      },
+    };
+
+    const persisted = await persistStepMetadata({
+      caseData: pipelineCaseData,
+      stepName: 'channels',
+      runId,
+      startedAt,
+      completedAt,
+      output,
+      user,
+    });
+
+    return {
+      ...output,
+      pipeline: persisted.pipeline,
+    };
+  } catch (error) {
+    await persistStepFailure({ caseData: pipelineCaseData, stepName: 'channels', runId, startedAt, error, user });
+    throw error;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+};
+
 const deleteLocalOutput = async (caseNumber, outputId) => {
   try {
     const outputPath = await resolveDenoiseOutputPath(caseNumber, outputId);
@@ -1047,5 +1254,6 @@ module.exports = {
   transcribeCvrForCase,
   identifyCvrRolesForCase,
   detectCvrEventsForCase,
+  separateCvrChannelsForCase,
   deleteDenoiseOutputForCase,
 };

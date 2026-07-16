@@ -23,11 +23,18 @@ class WavLMWrapper(nn.Module):
         logging.info("Loading WavLM-Plus model...")
         try:
             # Try loading from HuggingFace
-            self.wavlm = WavLMModel.from_pretrained("microsoft/wavlm-large")
+            # "main" resolves to an old commit with only pytorch_model.bin, which
+            # transformers refuses to torch.load on torch<2.6 (CVE-2025-32434).
+            # Pin to a commit that ships model.safetensors instead.
+            self.wavlm = WavLMModel.from_pretrained(
+                "microsoft/wavlm-large", revision="07d9d3d8576fd3d718ee7b16b2b6242e9610d9af"
+            )
             self.hidden_size = 1024  # wavlm-large hidden size
         except Exception as e:
             logging.warning(f"Failed to load wavlm-large, trying wavlm-base: {e}")
-            self.wavlm = WavLMModel.from_pretrained("microsoft/wavlm-base-plus")
+            self.wavlm = WavLMModel.from_pretrained(
+                "microsoft/wavlm-base-plus", revision="98fd61b9c652129c839c0a25a05987d8f59256a4"
+            )
             self.hidden_size = 768  # wavlm-base hidden size
 
         # Freeze base model (we'll only train the head)
@@ -105,11 +112,18 @@ class WavLMWrapper(nn.Module):
         logging.info("Loading WavLM-Plus model...")
         try:
             # Try loading from HuggingFace
-            self.wavlm = WavLMModel.from_pretrained("microsoft/wavlm-large")
+            # "main" resolves to an old commit with only pytorch_model.bin, which
+            # transformers refuses to torch.load on torch<2.6 (CVE-2025-32434).
+            # Pin to a commit that ships model.safetensors instead.
+            self.wavlm = WavLMModel.from_pretrained(
+                "microsoft/wavlm-large", revision="07d9d3d8576fd3d718ee7b16b2b6242e9610d9af"
+            )
             self.hidden_size = 1024  # wavlm-large hidden size
         except Exception as e:
             logging.warning(f"Failed to load wavlm-large, trying wavlm-base: {e}")
-            self.wavlm = WavLMModel.from_pretrained("microsoft/wavlm-base-plus")
+            self.wavlm = WavLMModel.from_pretrained(
+                "microsoft/wavlm-base-plus", revision="98fd61b9c652129c839c0a25a05987d8f59256a4"
+            )
             self.hidden_size = 768  # wavlm-base hidden size
 
         # Freeze base model (we'll only train the head)

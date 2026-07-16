@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import {
     CheckCircle2,
     ChevronRight,
@@ -13,6 +13,7 @@ import {
 import {
     deleteCvrDenoiseOutput,
     fetchCaseByNumber,
+    runCvrChannelSeparation,
     runCvrDenoise,
     runCvrEventDetection,
     runCvrEmotionAnalysis,
@@ -24,47 +25,24 @@ import { createDownloadTarget } from "../api/storage";
 import useRecentCases from "../hooks/useRecentCases";
 import { buildCasePreview } from "../utils/caseDisplay";
 import { evaluateModuleReadiness } from "../utils/analysisAvailability";
-
-const defaultCaseOptions = [
-    {
-        id: "AAI-UAE-2025-009",
-        title: "Abu Dhabi Mid-Air Near Miss",
-        aircraft: "A320-214",
-        date: "12 Feb 2025",
-        summary:
-            "Tower intervention prevented loss of separation between two aircraft departing from adjacent runways.",
-    },
-    {
-        id: "AAI-UAE-2024-031",
-        title: "Runway Excursion Investigation",
-        aircraft: "Boeing 787-9",
-        date: "28 Nov 2024",
-        summary:
-            "Flight crew reported directional control difficulties during landing roll in gusty crosswind conditions.",
-    },
-    {
-        id: "AAI-UAE-2025-014",
-        title: "Engine Surge Event",
-        aircraft: "A350-900",
-        date: "04 Mar 2025",
-        summary:
-            "Repeated compressor stalls captured on CVR prompted deep-dive analysis into cockpit coordination and alerts.",
-    },
-];
+import CvrCaseDetailsStep from "../components/CvrCaseDetailsStep";
+import CvrUploadStep from "../components/CvrUploadStep";
+import CvrReviewStep from "../components/CvrReviewStep";
+import CvrPhaseStepper from "../components/CvrPhaseStepper";
 
 
 
 const analysisStages = [
     {
-        key: "events",
-        label: "Event Detection",
-        description: "Detect alarms, impacts, and tonal anomalies in the original audio.",
+        key: "denoise",
+        label: "Audio Processing",
+        description: "Reducing background noise and separating channels while preserving speech.",
         optional: true,
     },
     {
-        key: "denoise",
-        label: "Denoising",
-        description: "Reducing background noise while preserving speech.",
+        key: "channels",
+        label: "Channel Separation",
+        description: "Isolate each speaker's audio using diarization.",
         optional: true,
     },
     {
@@ -74,16 +52,24 @@ const analysisStages = [
         optional: false,
     },
     {
+        key: "events",
+        label: "Key Event Identification",
+        description: "Detect alarms, impacts, and tonal anomalies in the original audio.",
+        optional: true,
+    },
+    {
         key: "roles",
         label: "Role Identification",
         description: "Map speaker labels to cockpit roles using role identification.",
         optional: true,
+        group: "analysis",
     },
     {
         key: "emotion",
         label: "Emotion Recognition",
         description: "Estimate the dominant cockpit emotion from the CVR audio.",
         optional: true,
+        group: "analysis",
     },
 ];
 
@@ -128,22 +114,29 @@ const StepBadge = ({ status }) => {
     );
 };
 
-const ProgressStep = ({ label, description, status, isActive }) => (
-    <div className="flex flex-col items-center text-center flex-1">
-        <StepBadge status={status} />
-        <p className={`mt-3 text-sm font-semibold ${isActive ? "text-emerald-700" : "text-gray-800"}`}>
-            {label}
-        </p>
-        <p className={`mt-1 text-xs max-w-[160px] ${isActive ? "text-emerald-600" : "text-gray-500"}`}>
-            {description}
-        </p>
-        {isActive && status !== "current" && status !== "error" && (
-            <span className="mt-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
-                Reviewing
-            </span>
-        )}
-    </div>
-);
+const ProgressStep = ({ label, description, status, isActive, onClick }) => {
+    const Wrapper = onClick ? "button" : "div";
+    return (
+        <Wrapper
+            type={onClick ? "button" : undefined}
+            onClick={onClick}
+            className={`flex flex-col items-center text-center flex-1 ${onClick ? "cursor-pointer" : ""}`}
+        >
+            <StepBadge status={status} />
+            <p className={`mt-3 text-sm font-semibold ${isActive ? "text-emerald-700" : "text-gray-800"}`}>
+                {label}
+            </p>
+            <p className={`mt-1 text-xs max-w-[160px] ${isActive ? "text-emerald-600" : "text-gray-500"}`}>
+                {description}
+            </p>
+            {isActive && status !== "current" && status !== "error" && (
+                <span className="mt-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                    Reviewing
+                </span>
+            )}
+        </Wrapper>
+    );
+};
 
 const TabButton = ({ isActive, onClick, children, disabled = false }) => (
     <button
@@ -163,19 +156,22 @@ export default function CVR({ caseNumber: propCaseNumber }) {
     const { caseNumber: routeCaseNumber } = useParams();
     const caseNumber = propCaseNumber || routeCaseNumber;
     const navigate = useNavigate();
+    const location = useLocation();
+    const viaCaseDetailsFlowRef = useRef(Boolean(location.state?.viaCaseDetailsFlow));
     const [selectedCase, setSelectedCase] = useState(null);
     const [selectedCaseData, setSelectedCaseData] = useState(null);
     const isLinkedRoute = Boolean(caseNumber);
     const [workflowStage, setWorkflowStage] = useState(
-        isLinkedRoute ? "analysis" : "caseSelection"
+        isLinkedRoute ? "analysis" : "caseDetails"
     );
     const [showResults, setShowResults] = useState(false);
-    const [activeTab, setActiveTab] = useState("events");
+    const [activeTab, setActiveTab] = useState("denoise");
     const [denoiseMethod, setDenoiseMethod] = useState("facebook_denoiser");
     const [denoisedAudioUrl, setDenoisedAudioUrl] = useState("");
     const [originalAudioUrl, setOriginalAudioUrl] = useState("");
     const [selectedCvrSourceKey, setSelectedCvrSourceKey] = useState("auto");
     const [eventDetectionSourceKey, setEventDetectionSourceKey] = useState("auto");
+    const [channelSeparationSourceKey, setChannelSeparationSourceKey] = useState("auto");
     const [transcriptionCvrSourceKey, setTranscriptionCvrSourceKey] = useState("auto");
     const [transcriptionModel, setTranscriptionModel] = useState("openai/whisper-large-v3");
     const [transcriptionSource, setTranscriptionSource] = useState("auto");
@@ -187,6 +183,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
     const [eventAudioUrls, setEventAudioUrls] = useState({});
     const [pipelineState, setPipelineState] = useState(null);
     const [transcriptionBlocker, setTranscriptionBlocker] = useState("");
+    const [transcriptionBlockerTitle, setTranscriptionBlockerTitle] = useState("Transcription required");
     const [transcriptionSkipPrompt, setTranscriptionSkipPrompt] = useState(false);
     const [denoiseSkipNotice, setDenoiseSkipNotice] = useState("");
     const [denoiseHistoryNotice, setDenoiseHistoryNotice] = useState("");
@@ -195,14 +192,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
     const [showCaseMenu, setShowCaseMenu] = useState(false);
     const caseMenuRef = useRef(null);
     const pipelineInitializedRef = useRef(false);
-    const { recentCases, loading: isRecentLoading, error: recentCasesError } =
-        useRecentCases(3);
-    const caseSelectionOptions = useMemo(() => {
-        const mapped = recentCases
-            .map((item) => buildCasePreview(item))
-            .filter(Boolean);
-        return mapped.length > 0 ? mapped : defaultCaseOptions;
-    }, [recentCases]);
+    const { recentCases } = useRecentCases(3);
     const cvrReadyCases = useMemo(() => {
         const list = recentCases.filter((item) => evaluateModuleReadiness(item, "cvr").ready);
         return list;
@@ -380,6 +370,37 @@ export default function CVR({ caseNumber: propCaseNumber }) {
         return cvrAttachments[0] || null;
     }, [cvrAttachments, selectedCvrSourceKey]);
 
+    const clearStaleAudioErrors = useCallback((pipeline) => {
+        if (!pipeline) {
+            return pipeline;
+        }
+
+        const isAudioMissingError = (message) =>
+            /audio (file )?not found|re-upload|not available for this case/i.test(message || "");
+
+        let changed = false;
+        const nextSteps = { ...pipeline.steps };
+        Object.keys(nextSteps).forEach((key) => {
+            const step = nextSteps[key];
+            if (step?.status === "error" && isAudioMissingError(step.error)) {
+                nextSteps[key] = { ...step, status: "pending", error: "" };
+                changed = true;
+            }
+        });
+
+        let nextEventDetection = pipeline.eventDetection;
+        if (pipeline.eventDetection?.status === "error" && isAudioMissingError(pipeline.eventDetection.error)) {
+            nextEventDetection = { status: "idle", events: [], error: "" };
+            changed = true;
+        }
+
+        if (!changed) {
+            return pipeline;
+        }
+
+        return { ...pipeline, steps: nextSteps, eventDetection: nextEventDetection };
+    }, []);
+
     const buildInitialPipeline = useCallback(() => ({
         version: 1,
         current: analysisStages[0]?.key || "denoise",
@@ -402,9 +423,9 @@ export default function CVR({ caseNumber: propCaseNumber }) {
             setMissingDataTypes([]);
             setSelectedCase(null);
             setSelectedCaseData(null);
-            setWorkflowStage("caseSelection");
+            setWorkflowStage("caseDetails");
             setShowResults(false);
-            setActiveTab("events");
+            setActiveTab("denoise");
             setPipelineState(null);
             setSelectedCvrSourceKey("auto");
             setEventDetectionSourceKey("auto");
@@ -418,7 +439,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
 
         if (selectedCase?.id === caseNumber) {
             lastLinkedCaseRef.current = caseNumber;
-            if (!isLinkedRoute && workflowStage === "caseSelection") {
+            if (!isLinkedRoute && workflowStage === "caseDetails") {
                 setWorkflowStage("analysis");
             }
             return;
@@ -435,18 +456,33 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                 }
 
                 const evaluation = evaluateModuleReadiness(data, "cvr");
+                const preview = buildCasePreview(data);
                 if (!evaluation.ready) {
                     setLinkError(evaluation.message);
                     setMissingDataTypes(evaluation.missingTypes || []);
-                    setSelectedCase(null);
-                    setWorkflowStage("analysis");
+                    setSelectedCase(preview);
+                    setSelectedCaseData(data);
+                    setWorkflowStage("cvrUpload");
+                    lastLinkedCaseRef.current = caseNumber;
                     return;
                 }
 
-                const preview = buildCasePreview(data);
+                if (viaCaseDetailsFlowRef.current) {
+                    // Arrived via the Case Details picker (not a direct case link) — walk
+                    // through Upload/Edit and Review even though data already exists,
+                    // instead of jumping straight into Analysis.
+                    setSelectedCase(preview);
+                    setSelectedCaseData(data);
+                    setLinkError("");
+                    setMissingDataTypes([]);
+                    setWorkflowStage("cvrUpload");
+                    lastLinkedCaseRef.current = caseNumber;
+                    return;
+                }
+
                 setSelectedCase(preview);
                 setSelectedCaseData(data);
-                setActiveTab("events");
+                setActiveTab("denoise");
                 setShowResults(false);
                 setDenoisedAudioUrl("");
                 setOriginalAudioUrl("");
@@ -468,7 +504,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                 setMissingDataTypes([]);
                 setSelectedCase(null);
                 setSelectedCaseData(null);
-                setWorkflowStage(isLinkedRoute ? "analysis" : "caseSelection");
+                setWorkflowStage(isLinkedRoute ? "analysis" : "caseDetails");
             });
 
         return () => {
@@ -511,12 +547,21 @@ export default function CVR({ caseNumber: propCaseNumber }) {
         })();
 
         const casePipeline = selectedCaseData?.analyses?.cvr?.pipeline;
-        const initialPipeline = casePipeline || storedPipeline || buildInitialPipeline();
+        // The server also computes its own `analyses.cvr.pipeline.stepStatuses` summary
+        // for cases that have never called the pipeline-persistence endpoint — that shape
+        // has no `.steps`, which is what this UI actually reads from. Only trust a
+        // server-provided pipeline if it's in the shape we persist ourselves.
+        const hasValidSteps = casePipeline && typeof casePipeline.steps === "object" && casePipeline.steps !== null;
+        let initialPipeline = (hasValidSteps ? casePipeline : null) || storedPipeline || buildInitialPipeline();
+
+        if (cvrAttachments.length > 0) {
+            initialPipeline = clearStaleAudioErrors(initialPipeline);
+        }
 
         pipelineInitializedRef.current = false;
         setPipelineState(initialPipeline);
-        setActiveTab(initialPipeline.current || "events");
-    }, [caseNumber, selectedCaseData, pipelineStorageKey, buildInitialPipeline]);
+        setActiveTab(initialPipeline.current || "denoise");
+    }, [caseNumber, selectedCaseData, pipelineStorageKey, buildInitialPipeline, cvrAttachments, clearStaleAudioErrors]);
 
     useEffect(() => {
         if (!resolvedCaseNumber || !pipelineState) {
@@ -550,7 +595,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
 
 
     useEffect(() => {
-        if (!isLinkedRoute && workflowStage === "caseSelection") {
+        if (!isLinkedRoute && workflowStage === "caseDetails") {
             setShowResults(false);
         }
     }, [workflowStage]);
@@ -781,6 +826,41 @@ export default function CVR({ caseNumber: propCaseNumber }) {
         selectedCvrSourceKey,
     ]);
 
+    const runChannelSeparation = useCallback(async () => {
+        const targetCaseNumber = caseNumber || selectedCase?.id;
+        if (!targetCaseNumber || !selectedCvrAttachment) {
+            setStepData("channels", {
+                status: "error",
+                error: "CVR audio is not available for this case.",
+            });
+            return;
+        }
+
+        startStep("channels");
+
+        try {
+            const result = await runCvrChannelSeparation(targetCaseNumber, {
+                sourceObjectKey: channelSeparationSourceKey !== "auto" ? channelSeparationSourceKey : null,
+            });
+            completeStep("channels", {
+                channels: result?.channels || [],
+            });
+        } catch (error) {
+            setStepData("channels", {
+                status: "error",
+                error: error?.message || "Failed to separate channels.",
+            });
+        }
+    }, [
+        caseNumber,
+        selectedCase,
+        selectedCvrAttachment,
+        channelSeparationSourceKey,
+        setStepData,
+        completeStep,
+        startStep,
+    ]);
+
     const progressSteps = analysisStages.map((stage) => {
         const stepStatus = getStepData(stage.key).status || "pending";
         let status = "upcoming";
@@ -799,10 +879,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
     });
 
     const currentStage = progressSteps.find((step) => step.status === "current");
-    const activeStageLabel =
-        activeTab === "events"
-            ? "Event detection"
-            : analysisStages.find((stage) => stage.key === activeTab)?.label || "Not started";
+    const activeStageLabel = analysisStages.find((stage) => stage.key === activeTab)?.label || "Not started";
     const completedCount = analysisStages.filter((stage) => {
         const status = getStepData(stage.key).status;
         return status === "completed" || status === "skipped";
@@ -810,12 +887,18 @@ export default function CVR({ caseNumber: propCaseNumber }) {
     const progressPercent = Math.round((completedCount / analysisStages.length) * 100);
     const hasStarted = showResults || completedCount > 0 || getStepData("denoise").status !== "pending";
     const denoiseStep = getStepData("denoise");
+    const channelsStep = getStepData("channels");
     const transcriptionStep = getStepData("transcription");
     const rolesStep = getStepData("roles");
     const emotionStep = getStepData("emotion");
     const eventDetection = pipelineState?.eventDetection || { status: "idle", events: [] };
     const eventDetectionEvents = eventDetection.events || [];
     const isTranscriptionComplete = transcriptionStep.status === "completed";
+    const hasDiarizedTranscript = Boolean(
+        transcriptionStep.output?.diarizedTranscript?.length ||
+            transcriptionStep.output?.diarization?.length,
+    );
+    const isRoleIdentificationReady = isTranscriptionComplete && hasDiarizedTranscript;
     const denoiseReady = ["completed", "skipped"].includes(denoiseStep.status);
     const canSelectTranscriptionChannel =
         transcriptionSource === "original" ||
@@ -830,9 +913,28 @@ export default function CVR({ caseNumber: propCaseNumber }) {
         }));
         setActiveTab(key);
     }, [updatePipelineState]);
-    const warnTranscriptionDependency = useCallback((message) => {
+    const warnTranscriptionDependency = useCallback((message, title = "Transcription required") => {
+        setTranscriptionBlockerTitle(title);
         setTranscriptionBlocker(message);
     }, []);
+
+    useEffect(() => {
+        if (activeTab !== "roles") {
+            return;
+        }
+        if (!isTranscriptionComplete) {
+            warnTranscriptionDependency(
+                "Role identification requires transcription. Complete it to continue (skipping keeps role identification and final insights locked).",
+            );
+            return;
+        }
+        if (!hasDiarizedTranscript) {
+            warnTranscriptionDependency(
+                "This transcript has no diarized speaker segments. Go back to Transcription, enable \"Enable speaker diarization\", and re-run it before continuing.",
+                "Diarization required",
+            );
+        }
+    }, [activeTab, isTranscriptionComplete, hasDiarizedTranscript, warnTranscriptionDependency]);
 
     const runTranscription = useCallback(async () => {
         const targetCaseNumber = caseNumber || selectedCase?.id;
@@ -910,6 +1012,14 @@ export default function CVR({ caseNumber: propCaseNumber }) {
             return;
         }
 
+        if (!hasDiarizedTranscript) {
+            setStepData("roles", {
+                status: "error",
+                error: "This transcript has no diarized speaker segments. Enable speaker diarization on the Transcription step and re-run it first.",
+            });
+            return;
+        }
+
         startStep("roles");
         try {
             const result = await runCvrRoleIdentification(targetCaseNumber, {});
@@ -925,7 +1035,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                 error: error?.message || "Failed to run role identification.",
             });
         }
-    }, [caseNumber, selectedCase, startStep, completeStep, setStepData]);
+    }, [caseNumber, selectedCase, startStep, completeStep, setStepData, hasDiarizedTranscript]);
 
     const runEventDetection = useCallback(async () => {
         const targetCaseNumber = caseNumber || selectedCase?.id;
@@ -1055,6 +1165,58 @@ export default function CVR({ caseNumber: propCaseNumber }) {
             ? "Analysis in progress"
             : "Ready for analysis";
 
+    const stepperDisplayStages = (() => {
+        const grouped = [];
+        let analysisNode = null;
+
+        progressSteps.forEach((step) => {
+            if (step.group === "analysis") {
+                if (!analysisNode) {
+                    analysisNode = {
+                        key: "analysis-group",
+                        label: "Analysis",
+                        description: "Tone, workload, and crew coordination.",
+                        status: step.status,
+                        isActive: step.isActive,
+                        statuses: [step.status],
+                    };
+                    grouped.push(analysisNode);
+                } else {
+                    analysisNode.statuses.push(step.status);
+                    analysisNode.isActive = analysisNode.isActive || step.isActive;
+                }
+                return;
+            }
+
+            grouped.push(step);
+        });
+
+        if (analysisNode) {
+            const { statuses } = analysisNode;
+            if (statuses.some((status) => status === "error")) {
+                analysisNode.status = "error";
+            } else if (statuses.some((status) => status === "current")) {
+                analysisNode.status = "current";
+            } else if (statuses.every((status) => status === "complete" || status === "skipped")) {
+                analysisNode.status = statuses.every((status) => status === "skipped") ? "skipped" : "complete";
+            } else {
+                analysisNode.status = "upcoming";
+            }
+            delete analysisNode.statuses;
+        }
+
+        grouped.push({
+            key: "report",
+            label: "CVR Analysis Report",
+            description: "Export the final cockpit voice analysis report.",
+            status: activeTab === "report" ? "current" : allStepsResolved ? "current" : "upcoming",
+            isActive: activeTab === "report",
+            onClick: () => goToStep("report"),
+        });
+
+        return grouped;
+    })();
+
     const generateFinalInsights = useCallback(() => {
         const caseId = selectedCase?.id || caseNumber;
         if (!caseId) {
@@ -1165,12 +1327,12 @@ export default function CVR({ caseNumber: propCaseNumber }) {
             </div>
 
             <div className="flex flex-col lg:flex-row items-center gap-4">
-                {progressSteps.map((step, index) => {
+                {stepperDisplayStages.map((step, index) => {
                     const { key: stageKey, ...stepProps } = step;
                     return (
                         <React.Fragment key={stageKey || step.label}>
                             <ProgressStep {...stepProps} />
-                            {index < progressSteps.length - 1 && (
+                            {index < stepperDisplayStages.length - 1 && (
                                 <div className="hidden lg:block h-px flex-1 bg-gray-200" />
                             )}
                         </React.Fragment>
@@ -1179,23 +1341,6 @@ export default function CVR({ caseNumber: propCaseNumber }) {
             </div>
         </>
     );
-
-    const handleCaseSelect = (caseItem) => {
-        setSelectedCase(caseItem);
-        setSelectedCaseData(caseItem?.source || null);
-        setWorkflowStage("caseSelection");
-        setActiveTab("events");
-        setShowResults(false);
-        setDenoisedAudioUrl("");
-        setOriginalAudioUrl("");
-        setDenoiseMethod("facebook_denoiser");
-        setSelectedCvrSourceKey("auto");
-        setEventDetectionSourceKey("auto");
-        setTranscriptionCvrSourceKey("auto");
-        setPipelineState(buildInitialPipeline());
-        setLinkError("");
-        setMissingDataTypes([]);
-    };
 
     const handleStartAnalysis = () => {
         if (!selectedCase) return;
@@ -1210,7 +1355,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
         }
         setWorkflowStage("analysis");
         setShowResults(true);
-        setActiveTab("events");
+        setActiveTab("denoise");
         if (!pipelineState) {
             updatePipelineState(buildInitialPipeline());
         }
@@ -1218,7 +1363,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
 
     const handleViewResults = () => {
         setShowResults(true);
-        setActiveTab("events");
+        setActiveTab("denoise");
     };
 
     const handleChangeCase = () => {
@@ -1228,7 +1373,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
         }
         setSelectedCase(null);
         setSelectedCaseData(null);
-        setWorkflowStage("caseSelection");
+        setWorkflowStage("caseDetails");
         setShowResults(false);
         setDenoisedAudioUrl("");
         setOriginalAudioUrl("");
@@ -1417,120 +1562,44 @@ export default function CVR({ caseNumber: propCaseNumber }) {
 
     const canOfferUpload = isLinkedRoute && missingDataTypes.length > 0;
 
-    if (!isLinkedRoute && workflowStage === "caseSelection") {
+    if (!isLinkedRoute && workflowStage === "caseDetails") {
+        return <CvrCaseDetailsStep />;
+    }
+
+    if (workflowStage === "cvrUpload" && selectedCase && selectedCaseData) {
         return (
-            <div className="max-w-6xl mx-auto space-y-8">
-                <header className="space-y-2">
-                    <p className="text-sm font-semibold text-emerald-600">CVR Module</p>
-                    <h1 className="text-3xl font-bold text-gray-900">Select a Case to Analyze Cockpit Audio</h1>
-                    <p className="text-gray-600 max-w-3xl">
-                        Choose the cockpit voice recorder investigation you want to examine. Once selected, the workspace will load
-                        AI-assisted separation, transcription, and emotional cues tailored to the incident.
-                    </p>
-                </header>
-
-                {(recentCasesError || linkError) && (
-                    <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-                        {linkError || recentCasesError}
-                    </div>
-                )}
-                {linkError && selectedCase && (
-                    <div className="flex flex-wrap items-center gap-3">
-                        <button
-                            type="button"
-                            onClick={handleUploadMissingData}
-                            className="inline-flex items-center gap-2 rounded-xl border border-emerald-500 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700 hover:bg-emerald-100"
-                        >
-                            Upload missing audio
-                        </button>
-                        <button
-                            type="button"
-                            onClick={handleNavigateToCases}
-                            className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50"
-                        >
-                            Browse cases
-                        </button>
-                    </div>
-                )}
-                {isRecentLoading && recentCases.length === 0 && (
-                    <div className="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-500">
-                        Loading recent cases...
-                    </div>
-                )}
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    {caseSelectionOptions.map((caseItem) => {
-                        const isActive = selectedCase?.id === caseItem.id;
-                        return (
-                            <button
-                                key={caseItem.id}
-                                type="button"
-                                onClick={() => handleCaseSelect(caseItem)}
-                                className={`text-left rounded-2xl border transition shadow-sm hover:-translate-y-0.5 hover:shadow-md focus:outline-none focus:ring-4 focus:ring-emerald-100 ${isActive ? "border-emerald-300 bg-emerald-50" : "border-gray-200 bg-white"
-                                    }`}
-                            >
-                                <div className="p-6 space-y-4">
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-xs uppercase tracking-wide text-gray-400">Case ID</span>
-                                        <span className="text-sm font-semibold text-emerald-600">{caseItem.date}</span>
-                                    </div>
-                                    <div>
-                                        <p className="text-sm font-semibold text-gray-800">{caseItem.id}</p>
-                                        <h2 className="mt-1 text-xl font-bold text-gray-900">{caseItem.title}</h2>
-                                    </div>
-                                    <p className="text-sm text-gray-600">{caseItem.summary}</p>
-                                    <div className="flex items-center justify-between text-sm">
-                                        <span className="text-gray-500">Aircraft</span>
-                                        <span className="font-medium text-gray-800">{caseItem.aircraft}</span>
-                                    </div>
-                                    {isActive && (
-                                        <div className="inline-flex items-center gap-2 rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
-                                            <span className="w-2 h-2 rounded-full bg-emerald-500" /> Selected case
-                                        </div>
-                                    )}
-                                </div>
-                            </button>
-                        );
-                    })}
-                    <button
-                        type="button"
-                        onClick={handleNavigateToCases}
-                        className="text-left rounded-2xl border-2 border-dashed border-emerald-200 bg-white transition shadow-sm hover:-translate-y-0.5 hover:shadow-md focus:outline-none focus:ring-4 focus:ring-emerald-100"
-                    >
-                        <div className="p-6 space-y-4">
-                            <div className="space-y-1">
-                                <span className="text-xs uppercase tracking-wide text-emerald-600">
-                                    Need a different investigation?
-                                </span>
-                                <h2 className="text-xl font-bold text-gray-900">Browse older cases</h2>
-                            </div>
-                            <p className="text-sm text-gray-600">
-                                Go to the Cases page to select from the full archive, then choose the analysis module you need.
-                            </p>
-                            <span className="inline-flex items-center gap-2 text-sm font-semibold text-emerald-600">
-                                Go to Cases
-                                <ChevronRight className="w-4 h-4" />
-                            </span>
-                        </div>
-                    </button>
-                </div>
-
-                <div className="flex items-center justify-between">
-                    <p className="text-sm text-gray-500">Select a case to unlock AI-assisted cockpit voice reconstruction.</p>
-                    <button
-                        type="button"
-                        onClick={handleStartAnalysis}
-                        disabled={!selectedCase}
-                        className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
-                    >
-                        Start CVR analysis
-                        <ChevronRight className="w-4 h-4" />
-                    </button>
-                </div>
-            </div>
+            <CvrUploadStep
+                caseNumber={selectedCase.id}
+                caseData={selectedCaseData}
+                cvrChannelOptions={cvrChannelOptions}
+                bannerMessage={linkError}
+                onUploaded={(updated) => {
+                    setSelectedCaseData(updated);
+                    setSelectedCase(buildCasePreview(updated));
+                    setLinkError("");
+                    setMissingDataTypes([]);
+                    setWorkflowStage("review");
+                }}
+            />
         );
     }
 
+    if (workflowStage === "review" && selectedCase && selectedCaseData) {
+        return (
+            <CvrReviewStep
+                caseNumber={selectedCase.id}
+                caseData={selectedCaseData}
+                onBack={() => setWorkflowStage("cvrUpload")}
+                onConfirm={() => {
+                    setActiveTab("denoise");
+                    setWorkflowStage("analysis");
+                    if (!pipelineState) {
+                        updatePipelineState(buildInitialPipeline());
+                    }
+                }}
+            />
+        );
+    }
 
     if (workflowStage === "analysis" && !selectedCase) {
       if (linkError) {
@@ -1564,7 +1633,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                         handleNavigateToCases();
                                         return;
                                     }
-                                    setWorkflowStage("caseSelection");
+                                    setWorkflowStage("caseDetails");
                                     setLinkError("");
                                 }}
                                 className="inline-flex items-center justify-center rounded-lg border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50"
@@ -1592,6 +1661,18 @@ export default function CVR({ caseNumber: propCaseNumber }) {
 
     return (
         <div className="max-w-7xl mx-auto space-y-8">
+            <CvrPhaseStepper
+                currentPhase="analysis"
+                onPhaseClick={(key) => {
+                    if (key === "details") {
+                        navigate("/cases/cvr", { state: { editCaseNumber: caseNumber || selectedCase?.id } });
+                    } else if (key === "upload") {
+                        setWorkflowStage("cvrUpload");
+                    } else if (key === "review") {
+                        setWorkflowStage("review");
+                    }
+                }}
+            />
             {denoiseSkipNotice && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 px-4">
                     <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
@@ -1739,7 +1820,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                     <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
                         <div className="flex items-start justify-between gap-3">
                             <div>
-                                <p className="text-sm font-semibold text-amber-700">Transcription required</p>
+                                <p className="text-sm font-semibold text-amber-700">{transcriptionBlockerTitle}</p>
                                 <p className="mt-2 text-sm text-gray-600">{transcriptionBlocker}</p>
                             </div>
                             <button
@@ -1764,7 +1845,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                     type="button"
                                     onClick={() => {
                                         setTranscriptionBlocker("");
-                                        setActiveTab("transcription");
+                                        goToStep("transcription");
                                     }}
                                     className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white"
                                 >
@@ -1847,6 +1928,13 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                             <p className="text-sm text-gray-500 mt-1">Status: {analysisStatusLabel}</p>
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setWorkflowStage("review")}
+                                className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
+                            >
+                                Back to Review
+                            </button>
                             {hasStarted && (
                                 <>
                                     <button
@@ -1998,35 +2086,40 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                             {isTranscriptionComplete ? "Cockpit Voice Insights" : "CVR Analysis Workspace"}
                                         </h3>
                                     </div>
-                                    <div className="flex flex-wrap gap-2">
-                                        <TabButton isActive={activeTab === "events"} onClick={() => setActiveTab("events")}>
-                                            Event Detection
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <TabButton isActive={activeTab === "denoise"} onClick={() => goToStep("denoise")}>
+                                            Audio Processing
                                         </TabButton>
-                                        <TabButton isActive={activeTab === "denoise"} onClick={() => setActiveTab("denoise")}>
-                                            Denoise
+                                        <TabButton isActive={activeTab === "channels"} onClick={() => goToStep("channels")}>
+                                            Channel Separation
                                         </TabButton>
-                                        <TabButton isActive={activeTab === "transcription"} onClick={() => setActiveTab("transcription")}>
+                                        <TabButton isActive={activeTab === "transcription"} onClick={() => goToStep("transcription")}>
                                             Transcription
                                         </TabButton>
-                                        <TabButton
-                                            isActive={activeTab === "roles"}
-                                            onClick={() => {
-                                                if (!isTranscriptionComplete) {
-                                                    warnTranscriptionDependency(
-                                                        "Role identification requires transcription. Complete it to continue (skipping keeps role identification and final insights locked).",
-                                                        );
-                                                        return;
-                                                    }
-                                                    setActiveTab("roles");
-                                                }}
-                                        >
-                                            Role Identification
+                                        <TabButton isActive={activeTab === "events"} onClick={() => goToStep("events")}>
+                                            Key Events
                                         </TabButton>
-                                        <TabButton
-                                            isActive={activeTab === "emotion"}
-                                            onClick={() => setActiveTab("emotion")}
-                                        >
-                                            Emotion Recognition
+                                        <div className="flex flex-col items-center gap-1 rounded-xl border border-gray-100 px-2 py-1">
+                                            <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+                                                Analysis
+                                            </span>
+                                            <div className="flex flex-wrap gap-2">
+                                                <TabButton
+                                                    isActive={activeTab === "roles"}
+                                                    onClick={() => goToStep("roles")}
+                                                >
+                                                    Role Identification
+                                                </TabButton>
+                                                <TabButton
+                                                    isActive={activeTab === "emotion"}
+                                                    onClick={() => goToStep("emotion")}
+                                                >
+                                                    Emotion Recognition
+                                                </TabButton>
+                                            </div>
+                                        </div>
+                                        <TabButton isActive={activeTab === "report"} onClick={() => goToStep("report")}>
+                                            Report
                                         </TabButton>
                                     </div>
                                 </div>
@@ -2265,19 +2358,120 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                                 </div>
                                             )}
                                         </div>
-                                        <div className="flex items-center justify-between gap-3 border-t border-gray-100 pt-4">
+                                        <div className="flex items-center justify-end gap-3 border-t border-gray-100 pt-4">
                                             <button
                                                 type="button"
-                                                onClick={() => goToStep("events")}
+                                                onClick={() => goToStep("channels")}
                                                 disabled={denoiseStep.status === "running"}
-                                                className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition disabled:cursor-not-allowed disabled:text-gray-300 disabled:border-gray-200"
+                                                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
+                                            >
+                                                Next
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {activeTab === "channels" && (
+                                <div className="px-6 py-6 space-y-6">
+                                    <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm space-y-6">
+                                        <div className="flex flex-wrap items-start justify-between gap-4">
+                                            <div>
+                                                <p className="text-sm font-semibold text-gray-900">Channel separation</p>
+                                                <p className="mt-2 text-sm text-gray-600">
+                                                    Isolate each speaker's audio using diarization, so you can listen to
+                                                    individual voices before transcription.
+                                                </p>
+                                            </div>
+                                            <div className="text-xs text-emerald-700">
+                                                {channelsStep.status === "running" ? "Processing…" : "Ready"}
+                                            </div>
+                                        </div>
+                                        <div className="flex flex-wrap items-end gap-4">
+                                            <div className="flex flex-col gap-1">
+                                                <label htmlFor="channels-source" className="text-xs font-semibold text-gray-500">
+                                                    Source audio
+                                                </label>
+                                                <select
+                                                    id="channels-source"
+                                                    value={channelSeparationSourceKey}
+                                                    onChange={(event) => setChannelSeparationSourceKey(event.target.value)}
+                                                    disabled={channelsStep.status === "running"}
+                                                    className="rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-100"
+                                                >
+                                                    {cvrSourceOptions.map((option) => (
+                                                        <option key={option.value} value={option.value}>
+                                                            {option.label}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={runChannelSeparation}
+                                                disabled={channelsStep.status === "running"}
+                                                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
+                                            >
+                                                {channelsStep.status === "running"
+                                                    ? "Running"
+                                                    : channelsStep.status === "completed"
+                                                    ? "Rerun separation"
+                                                    : "Run channel separation"}
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => skipStep("channels")}
+                                                disabled={channelsStep.status === "running" || channelsStep.status === "completed"}
+                                                className="inline-flex items-center gap-2 rounded-xl border border-amber-200 px-4 py-2 text-sm font-semibold text-amber-700 transition disabled:cursor-not-allowed disabled:text-gray-300 disabled:border-gray-200"
+                                            >
+                                                Skip step
+                                            </button>
+                                        </div>
+                                        {channelsStep.status === "error" && (
+                                            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                                                {channelsStep.error || "Channel separation failed."}
+                                            </div>
+                                        )}
+                                        {channelsStep.status === "skipped" && (
+                                            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                                                Channel separation was skipped.
+                                            </div>
+                                        )}
+                                        {channelsStep.status === "completed" && (
+                                            <div className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm space-y-4">
+                                                <p className="text-sm font-semibold text-gray-900">
+                                                    Separated speakers ({channelsStep.output?.channels?.length || 0})
+                                                </p>
+                                                {(channelsStep.output?.channels || []).map((channel) => (
+                                                    <div
+                                                        key={channel.speaker}
+                                                        className="rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 space-y-2"
+                                                    >
+                                                        <div className="flex items-center justify-between text-sm">
+                                                            <span className="font-semibold text-gray-800">{channel.speaker}</span>
+                                                            <span className="text-xs text-gray-500">
+                                                                {channel.duration ? `${channel.duration.toFixed(1)}s` : ""}
+                                                            </span>
+                                                        </div>
+                                                        {channel.downloadUrl && (
+                                                            <audio controls preload="none" src={channel.downloadUrl} className="w-full" />
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        <div className="flex items-center justify-between border-t border-gray-100 pt-4">
+                                            <button
+                                                type="button"
+                                                onClick={() => goToStep("denoise")}
+                                                className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
                                             >
                                                 Back
                                             </button>
                                             <button
                                                 type="button"
                                                 onClick={() => goToStep("transcription")}
-                                                disabled={denoiseStep.status === "running"}
+                                                disabled={channelsStep.status === "running"}
                                                 className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
                                             >
                                                 Next
@@ -2513,22 +2707,14 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-gray-100 pt-4">
                                             <button
                                                 type="button"
-                                                onClick={() => goToStep("denoise")}
+                                                onClick={() => goToStep("channels")}
                                                 className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
                                             >
                                                 Back
                                             </button>
                                             <button
                                                 type="button"
-                                                onClick={() => {
-                                                    if (!isTranscriptionComplete) {
-                                                        setTranscriptionBlocker(
-                                                            "Complete transcription to proceed. Skipping keeps role identification and final insights locked.",
-                                                        );
-                                                        return;
-                                                    }
-                                                    goToStep("roles");
-                                                }}
+                                                onClick={() => goToStep("events")}
                                                 disabled={transcriptionStep.status === "running"}
                                                 className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
                                             >
@@ -2553,6 +2739,21 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                                 ? "Completed"
                                                 : "Ready"}
                                         </div>
+                                        {isTranscriptionComplete && !hasDiarizedTranscript && (
+                                            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                                                This transcript doesn't include diarized speaker segments, so roles can't be
+                                                mapped. Go back to Transcription, enable{" "}
+                                                <span className="font-semibold">"Enable speaker diarization"</span>, and re-run
+                                                it before continuing.{" "}
+                                                <button
+                                                    type="button"
+                                                    onClick={() => goToStep("transcription")}
+                                                    className="font-semibold underline"
+                                                >
+                                                    Go to Transcription
+                                                </button>
+                                            </div>
+                                        )}
                                         <div className="mt-4 grid sm:grid-cols-2 gap-4 text-sm text-gray-500">
                                             <div className="rounded-xl border border-dashed border-gray-200 p-4">
                                                 Speaker A → Captain
@@ -2571,7 +2772,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                             <button
                                                 type="button"
                                                 onClick={runRoleIdentification}
-                                                disabled={rolesStep.status === "running" || !isTranscriptionComplete}
+                                                disabled={rolesStep.status === "running" || !isRoleIdentificationReady}
                                                 className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
                                             >
                                                 {rolesStep.status === "completed" ? "Rerun role identification" : "Run role identification"}
@@ -2657,7 +2858,7 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                         <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-gray-100 pt-4">
                                             <button
                                                 type="button"
-                                                onClick={() => goToStep("transcription")}
+                                                onClick={() => goToStep("events")}
                                                 className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
                                             >
                                                 Back
@@ -2861,14 +3062,14 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                         <div className="flex items-center justify-between border-t border-gray-100 pt-4">
                                             <button
                                                 type="button"
-                                                onClick={() => goToStep("roles")}
+                                                onClick={() => goToStep("transcription")}
                                                 className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
                                             >
                                                 Back
                                             </button>
                                             <button
                                                 type="button"
-                                                onClick={() => goToStep("denoise")}
+                                                onClick={() => goToStep("roles")}
                                                 className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition"
                                             >
                                                 Next
@@ -2932,13 +3133,125 @@ export default function CVR({ caseNumber: propCaseNumber }) {
                                                 {emotionStep.error || "Emotion recognition failed."}
                                             </div>
                                         )}
-                                        <div className="flex items-center justify-start border-t border-gray-100 pt-4">
+                                        <div className="flex items-center justify-between border-t border-gray-100 pt-4">
                                             <button
                                                 type="button"
-                                                onClick={() => goToStep("events")}
+                                                onClick={() => goToStep("roles")}
                                                 className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
                                             >
                                                 Back
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => goToStep("report")}
+                                                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition"
+                                            >
+                                                Next
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {activeTab === "report" && (
+                                <div className="px-6 py-6 space-y-6">
+                                    <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm space-y-6">
+                                        <div>
+                                            <p className="text-sm font-semibold text-gray-900">CVR analysis report</p>
+                                            <p className="mt-2 text-sm text-gray-600">
+                                                Review what's been produced across the pipeline, then generate the final
+                                                cockpit voice analysis report.
+                                            </p>
+                                        </div>
+
+                                        <div className="grid sm:grid-cols-2 gap-4">
+                                            {analysisStages.map((stage) => {
+                                                const stepData = getStepData(stage.key);
+                                                const stepStatus = stepData.status || "pending";
+                                                const badgeClass =
+                                                    stepStatus === "completed"
+                                                        ? "bg-emerald-100 text-emerald-700"
+                                                        : stepStatus === "skipped"
+                                                        ? "bg-amber-100 text-amber-700"
+                                                        : stepStatus === "error"
+                                                        ? "bg-rose-100 text-rose-700"
+                                                        : stepStatus === "running"
+                                                        ? "bg-sky-100 text-sky-700"
+                                                        : "bg-gray-100 text-gray-500";
+                                                return (
+                                                    <div
+                                                        key={stage.key}
+                                                        className="rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 flex items-center justify-between gap-3"
+                                                    >
+                                                        <span className="text-sm font-semibold text-gray-800">{stage.label}</span>
+                                                        <span
+                                                            className={`px-3 py-1 rounded-full text-xs font-semibold capitalize ${badgeClass}`}
+                                                        >
+                                                            {stepStatus}
+                                                        </span>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+
+                                        <div className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm space-y-4">
+                                            <p className="text-sm font-semibold text-gray-900">Key outputs</p>
+                                            <div className="space-y-1">
+                                                <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                                                    Transcript
+                                                </p>
+                                                <p className="text-sm text-gray-700">
+                                                    {transcriptionStep.output?.transcriptText
+                                                        ? `${transcriptionStep.output.transcriptText.slice(0, 240)}${
+                                                              transcriptionStep.output.transcriptText.length > 240 ? "…" : ""
+                                                          }`
+                                                        : "Transcription not completed yet."}
+                                                </p>
+                                            </div>
+                                            <div className="space-y-1">
+                                                <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                                                    Key events
+                                                </p>
+                                                <p className="text-sm text-gray-700">
+                                                    {eventDetectionEvents.length > 0
+                                                        ? `${eventDetectionEvents.length} event${
+                                                              eventDetectionEvents.length === 1 ? "" : "s"
+                                                          } detected.`
+                                                        : "No events detected yet."}
+                                                </p>
+                                            </div>
+                                            <div className="space-y-1">
+                                                <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                                                    Role identification
+                                                </p>
+                                                <p className="text-sm text-gray-700">
+                                                    {rolesStep.output?.summary || "Role identification not completed yet."}
+                                                </p>
+                                            </div>
+                                            <div className="space-y-1">
+                                                <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                                                    Emotion recognition
+                                                </p>
+                                                <p className="text-sm text-gray-700">
+                                                    {emotionStep.output?.summary || "Emotion recognition not completed yet."}
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center justify-between border-t border-gray-100 pt-4">
+                                            <button
+                                                type="button"
+                                                onClick={() => goToStep("emotion")}
+                                                className="inline-flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-600 transition hover:bg-gray-50"
+                                            >
+                                                Back
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={generateFinalInsights}
+                                                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition"
+                                            >
+                                                Generate Report
                                             </button>
                                         </div>
                                     </div>

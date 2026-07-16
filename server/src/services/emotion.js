@@ -26,6 +26,22 @@ const resolvePythonBin = () => {
 const PYTHON_BIN = resolvePythonBin();
 const EMOTION_SCRIPT = path.resolve(__dirname, '../../..', 'python_model', 'emotion_detection.py');
 const execFileAsync = promisify(execFile);
+
+// Conda envs put CUDA DLLs (e.g. nvrtc-builtins) in dirs that are only on PATH
+// after `conda activate`. We spawn python.exe directly, so add them ourselves.
+const PYTHON_ENV_DIR = path.dirname(PYTHON_BIN);
+const PYTHON_DLL_DIRS = [
+  PYTHON_ENV_DIR,
+  path.join(PYTHON_ENV_DIR, 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Library', 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Library', 'mingw-w64', 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Library', 'usr', 'bin'),
+  path.join(PYTHON_ENV_DIR, 'Scripts'),
+];
+const buildPythonSpawnEnv = () => ({
+  ...process.env,
+  PATH: [...PYTHON_DLL_DIRS, process.env.PATH].join(path.delimiter),
+});
 const OUTPUT_ROOT = path.resolve(__dirname, '../../cvr_outputs');
 const OUTPUT_BUCKET = process.env.MINIO_BUCKET || 'fdr-cvr-data';
 const buildDenoisePrefix = (caseNumber) => {
@@ -57,8 +73,9 @@ const runEmotionDetection = async (audioPath, backend = 'wavlm') => {
       PYTHON_BIN,
       [EMOTION_SCRIPT, '--audio', audioPath, '--backend', backend],
       {
-      timeout: 1000 * 60 * 5,
-    },
+        timeout: 1000 * 60 * 5,
+        env: buildPythonSpawnEnv(),
+      },
     );
     return parseJson(stdout);
   } catch (error) {
@@ -117,7 +134,7 @@ const loadOriginalAudioBuffer = async (caseNumber, attachment) => {
 };
 
 const detectEmotionForCase = async (caseNumber, options = {}) => {
-  console.log('🎤 Starting emotion detection for case:', caseNumber);
+    console.log({ message: '🎤 Starting emotion detection for case', caseNumber: String(caseNumber) });
   
   const caseData = await findCaseByNumber(caseNumber);
   if (!caseData) {

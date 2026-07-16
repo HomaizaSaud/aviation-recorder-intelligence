@@ -31,7 +31,15 @@ app.use(errorHandler);
 const startServer = async () => {
   try {
     await initializeDatabase();
-    await initializeStorage();
+
+    try {
+      await initializeStorage();
+    } catch (storageError) {
+      // Keep auth and case APIs available even when local object storage is not configured yet.
+      // Storage routes will still report errors when upload/download features are used.
+      // eslint-disable-next-line no-console
+      console.warn('Object storage initialization failed; continuing without verified storage.', storageError);
+    }
 
     app.listen(port, () => {
       // eslint-disable-next-line no-console

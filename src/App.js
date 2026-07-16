@@ -51,7 +51,7 @@ const AppRoutes = () => (
       <Route index element={<Dashboard />} />
       <Route path="cases" element={<Cases />} />
       <Route path="cases/fdr" element={<AnalysisModuleLauncher moduleKey="fdr" />} />
-      <Route path="cases/cvr" element={<AnalysisModuleLauncher moduleKey="cvr" />} />
+      <Route path="cases/cvr" element={<CVR />} />
       <Route path="cases/correlate" element={<CorrelationComingSoon />} />
       <Route path="cases/:caseNumber" element={<CaseDetails />} />
       <Route path="cases/:caseNumber/fdr" element={<FDR />} />

@@ -72,6 +72,12 @@ export const runCvrEventDetection = async (caseNumber, payload = {}) =>
     body: JSON.stringify(payload),
   });
 
+export const runCvrChannelSeparation = async (caseNumber, payload = {}) =>
+  request(buildCvrPath(caseNumber, 'channels'), {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
 export const runCvrEmotionAnalysis = async (caseNumber, payload = {}) =>
   request(`/cases/${caseNumber}/emotion-analysis`, {
     method: 'POST',
