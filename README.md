@@ -28,6 +28,13 @@ You can verify your toolchain with:
 node --version
 npm --version
 ```
+If you plan to use the CVR transcription/diarization pipeline (Python-based), you will also need:
+
+- **FFmpeg** (full-shared build with DLLs) – required by `torchcodec` for audio decoding. Install via:
+```bash
+  conda install -c conda-forge ffmpeg
+```
+  This must be installed inside the same Python/conda environment used to run the transcription scripts. A standard FFmpeg CLI-only install is not sufficient — torchcodec requires the shared library (`.dll`/`.so`) build.
 
 ## One-time setup
 
