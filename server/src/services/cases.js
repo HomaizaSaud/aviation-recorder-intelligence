@@ -819,6 +819,96 @@ const updateCaseCvrPipeline = async (caseNumber, pipeline, options = {}) => {
   );
 };
 
+const getFdrOccurrence = async (caseNumber) => {
+  const { rows } = await pool.query(
+    `SELECT analyses->'fdr'->'occurrenceWindow' AS window FROM cases WHERE case_number = $1`,
+    [caseNumber],
+  );
+  if (!rows[0]) return null;
+  const w = rows[0].window;
+  return {
+    start: w?.start ?? null,
+    end: w?.end ?? null,
+    label: w?.label ?? null,
+  };
+};
+
+const setFdrOccurrence = async (caseNumber, { start, end, label }) => {
+  const windowJson = JSON.stringify({
+    start: start ?? null,
+    end: end ?? null,
+    label: label ?? null,
+  });
+  const { rows } = await pool.query(
+    `UPDATE cases
+     SET analyses = jsonb_set(analyses, '{fdr,occurrenceWindow}', $1::jsonb, true),
+         updated_at = NOW()
+     WHERE case_number = $2
+     RETURNING analyses->'fdr'->'occurrenceWindow' AS window`,
+    [windowJson, caseNumber],
+  );
+  if (!rows[0]) return null;
+  const w = rows[0].window;
+  return {
+    start: w?.start ?? null,
+    end: w?.end ?? null,
+    label: w?.label ?? null,
+  };
+};
+
+const getFdrCorrections = async (caseNumber) => {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(analyses->'fdr'->'corrections', '[]'::jsonb) AS corrections FROM cases WHERE case_number = $1`,
+    [caseNumber],
+  );
+  if (!rows[0]) return null;
+  const c = rows[0].corrections;
+  return Array.isArray(c) ? c : [];
+};
+
+const addFdrCorrection = async (caseNumber, correction) => {
+  const { rows } = await pool.query(
+    `UPDATE cases
+     SET analyses = jsonb_set(
+       analyses,
+       '{fdr,corrections}',
+       COALESCE(analyses->'fdr'->'corrections', '[]'::jsonb) || $1::jsonb,
+       true
+     ),
+     updated_at = NOW()
+     WHERE case_number = $2
+     RETURNING analyses->'fdr'->'corrections' AS corrections`,
+    [JSON.stringify(correction), caseNumber],
+  );
+  if (!rows[0]) return null;
+  const c = rows[0].corrections;
+  return Array.isArray(c) ? c : [];
+};
+
+const deleteFdrCorrection = async (caseNumber, correctionId) => {
+  const { rows } = await pool.query(
+    `UPDATE cases
+     SET analyses = jsonb_set(
+       analyses,
+       '{fdr,corrections}',
+       COALESCE(
+         (SELECT jsonb_agg(elem)
+          FROM jsonb_array_elements(analyses->'fdr'->'corrections') elem
+          WHERE elem->>'id' != $1),
+         '[]'::jsonb
+       ),
+       true
+     ),
+     updated_at = NOW()
+     WHERE case_number = $2
+     RETURNING analyses->'fdr'->'corrections' AS corrections`,
+    [correctionId, caseNumber],
+  );
+  if (!rows[0]) return null;
+  const c = rows[0].corrections;
+  return Array.isArray(c) ? c : [];
+};
+
 module.exports = {
   listCases,
   findCaseByNumber,
@@ -829,4 +919,9 @@ module.exports = {
   updateCaseFdrAnalysis,
   updateCaseFdrAnalysisStatus,
   updateCaseCvrPipeline,
+  getFdrOccurrence,
+  setFdrOccurrence,
+  getFdrCorrections,
+  addFdrCorrection,
+  deleteFdrCorrection,
 };

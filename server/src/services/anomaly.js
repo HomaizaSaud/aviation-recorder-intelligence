@@ -40,6 +40,9 @@ const TIMESTAMP_FIELDS = ['GPS Date & Time', 'Session Time', 'System Time'];
 const ANALYSIS_VERSION = '1.0';
 const PYTHON_BIN = process.env.PYTHON_BIN || 'python3';
 const PYTHON_MODULE = 'services.fdr_anomaly.run_detect';
+const PYTHON_SEGMENT_MODULE = 'services.fdr_anomaly.run_segment';
+const PYTHON_PHASE_MODULE = 'services.fdr_anomaly.run_phase';
+const PYTHON_RULES_MODULE = 'services.fdr_anomaly.run_rules';
 const PYTHON_CWD = path.resolve(__dirname, '../../..');
 const execFileAsync = promisify(execFile);
 
@@ -430,6 +433,186 @@ const analyzeFdrForCase = async (caseNumber, options = {}) => {
   }
 };
 
+const segmentFlightsForCase = async (caseNumber) => {
+  const caseData = await findCaseByNumber(caseNumber);
+  if (!caseData) {
+    const error = new Error('Case not found');
+    error.status = 404;
+    throw error;
+  }
+
+  const fdrAttachment = findFdrAttachment(caseData);
+  if (!fdrAttachment || !fdrAttachment.storage || !fdrAttachment.storage.objectKey) {
+    const error = new Error('No FDR attachment found for this case.');
+    error.status = 404;
+    throw error;
+  }
+
+  const fileBuffer = await downloadObjectAsBuffer({
+    bucket: fdrAttachment.storage.bucket,
+    objectKey: fdrAttachment.storage.objectKey,
+  });
+
+  const extension = path.extname(fdrAttachment.storage.objectKey || '') || '.csv';
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fdr-segment-'));
+  const tempFilePath = path.join(tempDir, `fdr${extension}`);
+
+  try {
+    await fs.writeFile(tempFilePath, fileBuffer);
+    const { stdout, stderr } = await execFileAsync(
+      PYTHON_BIN,
+      ['-m', PYTHON_SEGMENT_MODULE, tempFilePath],
+      {
+        cwd: PYTHON_CWD,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024 * 10,
+      },
+    );
+    if (stderr) {
+      console.error('[segment] python stderr:', stderr);
+    }
+    return JSON.parse(stdout);
+  } catch (error) {
+    if (error?.stderr) {
+      console.error('[segment] python stderr:', error.stderr);
+    }
+    const message = parsePythonErrorMessage(error);
+    if (message) {
+      const pythonError = new Error(message);
+      pythonError.status = 400;
+      throw pythonError;
+    }
+    throw error;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+};
+
+const detectPhasesForCase = async (caseNumber) => {
+  const caseData = await findCaseByNumber(caseNumber);
+  if (!caseData) {
+    const error = new Error('Case not found');
+    error.status = 404;
+    throw error;
+  }
+
+  const fdrAttachment = findFdrAttachment(caseData);
+  if (!fdrAttachment || !fdrAttachment.storage || !fdrAttachment.storage.objectKey) {
+    const error = new Error('No FDR attachment found for this case.');
+    error.status = 404;
+    throw error;
+  }
+
+  const fileBuffer = await downloadObjectAsBuffer({
+    bucket: fdrAttachment.storage.bucket,
+    objectKey: fdrAttachment.storage.objectKey,
+  });
+
+  const extension = path.extname(fdrAttachment.storage.objectKey || '') || '.csv';
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fdr-phase-'));
+  const tempFilePath = path.join(tempDir, `fdr${extension}`);
+
+  try {
+    await fs.writeFile(tempFilePath, fileBuffer);
+    const { stdout, stderr } = await execFileAsync(
+      PYTHON_BIN,
+      ['-m', PYTHON_PHASE_MODULE, tempFilePath],
+      {
+        cwd: PYTHON_CWD,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024 * 10,
+      },
+    );
+    if (stderr) {
+      console.error('[phase] python stderr:', stderr);
+    }
+    return JSON.parse(stdout);
+  } catch (error) {
+    if (error?.stderr) {
+      console.error('[phase] python stderr:', error.stderr);
+    }
+    const message = parsePythonErrorMessage(error);
+    if (message) {
+      const pythonError = new Error(message);
+      pythonError.status = 400;
+      throw pythonError;
+    }
+    throw error;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+};
+
+const detectRulesForCase = async (caseNumber) => {
+  const caseData = await findCaseByNumber(caseNumber);
+  if (!caseData) {
+    const error = new Error('Case not found');
+    error.status = 404;
+    throw error;
+  }
+
+  const fdrAttachment = findFdrAttachment(caseData);
+  if (!fdrAttachment || !fdrAttachment.storage || !fdrAttachment.storage.objectKey) {
+    const error = new Error('No FDR attachment found for this case.');
+    error.status = 404;
+    throw error;
+  }
+
+  const fileBuffer = await downloadObjectAsBuffer({
+    bucket: fdrAttachment.storage.bucket,
+    objectKey: fdrAttachment.storage.objectKey,
+  });
+
+  const extension = path.extname(fdrAttachment.storage.objectKey || '') || '.csv';
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fdr-rules-'));
+  const tempFilePath = path.join(tempDir, `fdr${extension}`);
+
+  try {
+    await fs.writeFile(tempFilePath, fileBuffer);
+    console.log('[rules:DEBUG] python bin  :', PYTHON_BIN);
+    console.log('[rules:DEBUG] module      :', PYTHON_RULES_MODULE);
+    console.log('[rules:DEBUG] file path   :', tempFilePath);
+    console.log('[rules:DEBUG] cwd         :', PYTHON_CWD);
+    const { stdout, stderr } = await execFileAsync(
+      PYTHON_BIN,
+      ['-m', PYTHON_RULES_MODULE, tempFilePath],
+      {
+        cwd: PYTHON_CWD,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024 * 10,
+      },
+    );
+    if (stderr) {
+      console.error('[rules] python stderr:', stderr);
+    }
+    console.log('[rules:DEBUG] stdout length:', stdout?.length, '| first 200 chars:', stdout?.slice(0, 200));
+    const parsed = JSON.parse(stdout);
+    console.log('[rules:DEBUG] parsed OK — findings:', parsed?.findings?.length, '| rules_checked:', parsed?.rules_checked?.length);
+    return parsed;
+  } catch (error) {
+    console.error('[rules:DEBUG] CAUGHT ERROR:', error?.message);
+    console.error('[rules:DEBUG] error code  :', error?.code);
+    if (error?.stderr) {
+      console.error('[rules] python stderr:', error.stderr);
+    }
+    if (error?.stdout) {
+      console.error('[rules:DEBUG] python stdout (partial):', error.stdout?.slice(0, 500));
+    }
+    const message = parsePythonErrorMessage(error);
+    if (message) {
+      const pythonError = new Error(message);
+      pythonError.status = 400;
+      throw pythonError;
+    }
+    throw error;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+};
+
 module.exports = {
   analyzeFdrForCase,
+  segmentFlightsForCase,
+  detectPhasesForCase,
+  detectRulesForCase,
 };

@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const { detectEmotionForCase } = require('../services/emotion');
 const {
   listCases,
@@ -32,7 +33,8 @@ const {
   updateNote,
   deleteNote,
 } = require('../services/notes');
-const { analyzeFdrForCase } = require('../services/anomaly');
+const { analyzeFdrForCase, segmentFlightsForCase, detectPhasesForCase, detectRulesForCase } = require('../services/anomaly');
+const { getFdrOccurrence, setFdrOccurrence, getFdrCorrections, addFdrCorrection, deleteFdrCorrection } = require('../services/cases');
 const {
   denoiseCvrForCase,
   resolveDenoiseOutputPath,
@@ -91,6 +93,110 @@ router.get('/', async (req, res, next) => {
 router.post('/:caseNumber/fdr/analyze', async (req, res, next) => {
   try {
     const result = await analyzeFdrForCase(req.params.caseNumber, { user: req.user });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/segments', async (req, res, next) => {
+  try {
+    const result = await segmentFlightsForCase(req.params.caseNumber);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/phases', async (req, res, next) => {
+  try {
+    const result = await detectPhasesForCase(req.params.caseNumber);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/rules', async (req, res, next) => {
+  try {
+    const result = await detectRulesForCase(req.params.caseNumber);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/:caseNumber/fdr/occurrence', async (req, res, next) => {
+  try {
+    const result = await getFdrOccurrence(req.params.caseNumber);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.patch('/:caseNumber/fdr/occurrence', async (req, res, next) => {
+  try {
+    const { start, end, label } = req.body || {};
+    const result = await setFdrOccurrence(req.params.caseNumber, {
+      start: start == null ? null : Number(start),
+      end: end == null ? null : Number(end),
+      label: label == null ? null : String(label),
+    });
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/:caseNumber/fdr/corrections', async (req, res, next) => {
+  try {
+    const result = await getFdrCorrections(req.params.caseNumber);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:caseNumber/fdr/corrections', async (req, res, next) => {
+  try {
+    const correction = req.body || {};
+    const note = typeof correction.note === 'string' ? correction.note.trim() : '';
+    const entry = {
+      id: correction.id || crypto.randomUUID(),
+      type: correction.type || 'false_positive',
+      target_id: String(correction.target_id ?? ''),
+      original_value: correction.original_value ?? {},
+      corrected_value: correction.corrected_value ?? {},
+      investigator: String(correction.investigator ?? 'investigator'),
+      timestamp: correction.timestamp || new Date().toISOString(),
+      note,
+    };
+    const result = await addFdrCorrection(req.params.caseNumber, entry);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete('/:caseNumber/fdr/corrections/:correctionId', async (req, res, next) => {
+  try {
+    const result = await deleteFdrCorrection(req.params.caseNumber, req.params.correctionId);
+    if (result === null) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
     res.json(result);
   } catch (error) {
     next(error);
@@ -650,7 +756,12 @@ router.delete('/:caseNumber', async (req, res, next) => {
 });
 router.post('/:caseNumber/emotion-analysis', async (req, res, next) => {
   try {
-    const result = await detectEmotionForCase(req.params.caseNumber, req.body || {});
+    const caseNumber = String(req.params.caseNumber).replace(/[^\w-]/g, '');
+    if (!caseNumber) {
+      res.status(400).json({ error: 'Invalid case number.' });
+      return;
+    }
+    const result = await detectEmotionForCase(caseNumber, req.body || {});
     res.json(result);
   } catch (error) {
     next(error);

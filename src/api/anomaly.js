@@ -174,6 +174,60 @@ const detectAnomaliesLocally = (rows = []) => {
   };
 };
 
+export const fetchFdrSegments = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/segments`, {
+    method: 'POST',
+  });
+  return response;
+};
+
+export const fetchFdrPhases = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/phases`, {
+    method: 'POST',
+  });
+  return response;
+};
+
+export const fetchFdrRules = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/rules`, {
+    method: 'POST',
+  });
+  return response;
+};
+
+export const fetchFdrCorrections = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/corrections`, { method: 'GET' });
+  return response;
+};
+
+export const addFdrCorrection = async (caseId, correction) => {
+  const response = await request(`/cases/${caseId}/fdr/corrections`, {
+    method: 'POST',
+    body: JSON.stringify(correction),
+  });
+  return response;
+};
+
+export const deleteFdrCorrection = async (caseId, correctionId) => {
+  const response = await request(`/cases/${caseId}/fdr/corrections/${correctionId}`, { method: 'DELETE' });
+  return response;
+};
+
+export const fetchFdrOccurrence = async (caseId) => {
+  const response = await request(`/cases/${caseId}/fdr/occurrence`, {
+    method: 'GET',
+  });
+  return response;
+};
+
+export const saveFdrOccurrence = async (caseId, { start, end, label }) => {
+  const response = await request(`/cases/${caseId}/fdr/occurrence`, {
+    method: 'PATCH',
+    body: JSON.stringify({ start, end, label }),
+  });
+  return response;
+};
+
 export const runFdrAnomalyDetection = async (caseId, { rows = [] } = {}) => {
   const payload = {};
 
