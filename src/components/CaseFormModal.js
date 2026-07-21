@@ -45,7 +45,6 @@ const createDefaultValues = () => ({
   summary: '',
   lastUpdated: '',
   date: '',
-  tags: '',
   investigator: {
     name: '',
     organization: '',
@@ -158,9 +157,6 @@ const CaseFormModal = ({
       location: caseData?.location || caseData?.aircraft?.location || defaults.location,
       lastUpdated: formatDateInput(caseData?.lastUpdated),
       date: formatDateInput(caseData?.date),
-      tags: Array.isArray(caseData?.tags)
-        ? caseData.tags.join(', ')
-        : caseData?.tags || '',
       investigator: {
         ...defaults.investigator,
         ...(caseData?.investigator || {}),
@@ -495,13 +491,6 @@ const CaseFormModal = ({
         })),
       };
 
-      const tags = Array.isArray(formValues.tags)
-        ? formValues.tags
-        : (formValues.tags || '')
-          .split(',')
-          .map((tag) => tag.trim())
-          .filter(Boolean);
-
       const aircraft = {
         ...createDefaultValues().aircraft,
         ...formValues.aircraft,
@@ -565,7 +554,6 @@ const CaseFormModal = ({
         aircraft,
         attachments,
         timeline: [...existingTimeline, ...timelineUpdates],
-        tags,
         lastUpdated: normalizedLastUpdated,
         date: formatDateInput(formValues.date) || null,
       });
@@ -686,17 +674,6 @@ const CaseFormModal = ({
                   type="date"
                   value={formValues.date}
                   onChange={handleChange}
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
-              </label>
-              <label className="text-sm font-medium text-gray-700 flex flex-col gap-2 md:col-span-2">
-                Tags
-                <input
-                  name="tags"
-                  type="text"
-                  value={formValues.tags}
-                  onChange={handleChange}
-                  placeholder="Comma separated keywords"
                   className="w-full border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
               </label>

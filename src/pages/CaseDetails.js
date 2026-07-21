@@ -5,7 +5,6 @@ import {
   Calendar,
   MapPin,
   Plane,
-  Tags,
   FileText,
   AudioLines,
   PlaneTakeoff,
@@ -1042,7 +1041,6 @@ const CaseDetails = ({ caseNumber: propCaseNumber }) => {
     );
   }
 
-  const tags = Array.isArray(caseData.tags) ? caseData.tags : [];
   const investigatorInfo = caseData.investigator || {};
   const aircraftInfo = caseData.aircraft || {};
   const pendingDeleteKey =
@@ -1254,21 +1252,6 @@ const CaseDetails = ({ caseNumber: propCaseNumber }) => {
               <div className="flex items-center gap-2">
                 <Plane className="w-4 h-4 text-emerald-600" />
                 <span>Flight number: {aircraftInfo.flightNumber || '—'}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Tags className="w-4 h-4 text-emerald-600" />
-                <span className="flex flex-wrap gap-2">
-                  {tags.length > 0
-                    ? tags.map((tag) => (
-                        <span
-                          key={tag}
-                          className="px-2 py-1 bg-emerald-100 text-emerald-700 rounded-full text-xs font-medium"
-                        >
-                          {tag}
-                        </span>
-                      ))
-                    : 'No tags assigned.'}
-                </span>
               </div>
             </div>
           </div>

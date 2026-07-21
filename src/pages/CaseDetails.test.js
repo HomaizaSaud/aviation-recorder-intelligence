@@ -37,7 +37,6 @@ const caseResponse = {
   examiner: 'Exam',
   aircraftType: 'A1',
   lastUpdated: '2024-01-01',
-  tags: [],
   investigator: {},
   aircraft: {},
   analyses: {

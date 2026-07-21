@@ -13,7 +13,6 @@ import LoginPage from './pages/auth/LoginPage';
 import SignupPage from './pages/auth/SignupPage';
 import ForgotPasswordPage from './pages/auth/ForgotPasswordPage';
 import { AuthProvider, useAuth } from './hooks/useAuth';
-import AnalysisModuleLauncher from './pages/AnalysisModuleLauncher';
 import CorrelationComingSoon from './pages/CorrelationComingSoon';
 
 const ProtectedRoute = ({ children }) => {
@@ -50,7 +49,7 @@ const AppRoutes = () => (
     >
       <Route index element={<Dashboard />} />
       <Route path="cases" element={<Cases />} />
-      <Route path="cases/fdr" element={<AnalysisModuleLauncher moduleKey="fdr" />} />
+      <Route path="cases/fdr" element={<FDR />} />
       <Route path="cases/cvr" element={<CVR />} />
       <Route path="cases/correlate" element={<CorrelationComingSoon />} />
       <Route path="cases/:caseNumber" element={<CaseDetails />} />

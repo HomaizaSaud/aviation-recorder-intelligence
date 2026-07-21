@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
-import { ChevronRight } from "lucide-react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, Polyline, CircleMarker } from 'react-leaflet';
 import {
@@ -16,42 +15,17 @@ import {
     Legend,
 } from "recharts";
 import NotesPanel from "../components/NotesPanel";
+import FdrCaseDetailsStep from "../components/FdrCaseDetailsStep";
+import FdrUploadStep from "../components/FdrUploadStep";
+import FdrPhaseStepper from "../components/FdrPhaseStepper";
 import { fetchCaseByNumber, updateCase } from "../api/cases";
 import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence, fetchFdrRules, fetchFdrCorrections, addFdrCorrection, deleteFdrCorrection } from "../api/anomaly";
 import { useAuth } from "../hooks/useAuth";
-import useRecentCases from "../hooks/useRecentCases";
 import { buildCasePreview } from "../utils/caseDisplay";
 import { evaluateModuleReadiness } from "../utils/analysisAvailability";
 import { fetchAttachmentFromObjectStore } from "../utils/storage";
 import { fdrParameterMap, fdrParameterConfig } from "../config/fdr-parameters";
 import { createTimelineEntry, resolveActor } from "../utils/timeline";
-
-const defaultCaseOptions = [
-    {
-        id: "AAI-UAE-2025-009",
-        title: "Abu Dhabi Mid-Air Near Miss",
-        aircraft: "A320-214",
-        date: "12 Feb 2025",
-        summary:
-            "ATC intervention prevented conflict between Flight AZ217 and Flight FJ904 during climb out.",
-    },
-    {
-        id: "AAI-UAE-2024-031",
-        title: "Runway Excursion Investigation",
-        aircraft: "Boeing 787-9",
-        date: "28 Nov 2024",
-        summary:
-            "Aircraft veered left after touchdown in heavy crosswinds, triggering safety review.",
-    },
-    {
-        id: "AAI-UAE-2025-014",
-        title: "Engine Surge Event",
-        aircraft: "A350-900",
-        date: "04 Mar 2025",
-        summary:
-            "Crew reported repeated engine surges during climb with temporary loss of thrust.",
-    },
-];
 
 const colorPalette = [
     "#059669",
@@ -1012,8 +986,11 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const { caseNumber: routeCaseNumber } = useParams();
     const caseNumber = propCaseNumber || routeCaseNumber;
     const navigate = useNavigate();
+    const location = useLocation();
+    const viaCaseDetailsFlowRef = useRef(Boolean(location.state?.viaCaseDetailsFlow));
     const { user } = useAuth();
     const [selectedCase, setSelectedCase] = useState(null);
+    const [selectedCaseData, setSelectedCaseData] = useState(null);
     const [isRunningDetection, setIsRunningDetection] = useState(false);
     const [detectionTrendData, setDetectionTrendData] = useState(
         defaultDetectionTrendSamples
@@ -1075,7 +1052,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const chartsRef = useRef(null);
     const isLinkedRoute = Boolean(caseNumber);
     const [workflowStage, setWorkflowStage] = useState(
-        isLinkedRoute ? "analysis" : "caseSelection"
+        isLinkedRoute ? "analysis" : "caseDetails"
     );
     const [analysisEntryChoice, setAnalysisEntryChoice] = useState(null);
     const pendingRunRef = useRef(null);
@@ -1670,14 +1647,6 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 (Array.isArray(normalizedRows) ? normalizedRows.length : undefined),
         });
     }, [anomalyResult, normalizedRows, segments.length]);
-    const { recentCases, loading: isRecentLoading, error: recentCasesError } =
-        useRecentCases(3);
-    const caseSelectionOptions = useMemo(() => {
-        const mapped = recentCases
-            .map((item) => buildCasePreview(item))
-            .filter(Boolean);
-        return mapped.length > 0 ? mapped : defaultCaseOptions;
-    }, [recentCases]);
     const [linkError, setLinkError] = useState("");
     const [missingDataTypes, setMissingDataTypes] = useState([]);
     const lastLinkedCaseRef = useRef(null);
@@ -1695,7 +1664,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
         if (selectedCase?.id === caseNumber) {
             lastLinkedCaseRef.current = caseNumber;
-            setWorkflowStage((prev) => (prev === "caseSelection" ? "analysis" : prev));
+            setWorkflowStage((prev) => (prev === "caseDetails" ? "analysis" : prev));
             return;
         }
 
@@ -1710,16 +1679,32 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 }
 
                 const evaluation = evaluateModuleReadiness(data, "fdr");
+                const preview = buildCasePreview(data);
                 if (!evaluation.ready) {
                     setLinkError(evaluation.message);
                     setMissingDataTypes(evaluation.missingTypes || []);
-                    setSelectedCase(null);
-                    setWorkflowStage("analysis");
+                    setSelectedCase(preview);
+                    setSelectedCaseData(data);
+                    setWorkflowStage("fdrUpload");
+                    lastLinkedCaseRef.current = caseNumber;
                     return;
                 }
 
-                const preview = buildCasePreview(data);
+                if (viaCaseDetailsFlowRef.current) {
+                    // Arrived via the Case Details picker (not a direct case link) — walk
+                    // through Upload/Edit even though data already exists, instead of
+                    // jumping straight into the analysis workspace.
+                    setSelectedCase(preview);
+                    setSelectedCaseData(data);
+                    setLinkError("");
+                    setMissingDataTypes([]);
+                    setWorkflowStage("fdrUpload");
+                    lastLinkedCaseRef.current = caseNumber;
+                    return;
+                }
+
                 setSelectedCase(preview);
+                setSelectedCaseData(data);
                 setWorkflowStage("analysis");
                 lastLinkedCaseRef.current = caseNumber;
                 setLinkError("");
@@ -1733,7 +1718,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 setLinkError(err?.message || "Unable to open the selected case");
                 setMissingDataTypes([]);
                 setSelectedCase(null);
-                setWorkflowStage(isLinkedRoute ? "analysis" : "caseSelection");
+                setSelectedCaseData(null);
+                setWorkflowStage(isLinkedRoute ? "analysis" : "caseDetails");
             });
 
         return () => {
@@ -1767,7 +1753,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
         if (hasResults && analysisEntryChoice === null) {
             setWorkflowStage((prev) =>
-                prev === "analysis" || prev === "caseSelection" ? "analysisChoice" : prev
+                prev === "analysis" || prev === "caseDetails" ? "analysisChoice" : prev
             );
             return;
         }
@@ -1789,7 +1775,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         if (savedAnalysis) {
             setWorkflowStage((prev) =>
                 prev === "analysis" ||
-                prev === "caseSelection" ||
+                prev === "caseDetails" ||
                 prev === "detectionRunning" ||
                 prev === "detectionError"
                     ? "results"
@@ -2009,7 +1995,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
             navigate("/cases");
             return;
         }
-        setWorkflowStage("caseSelection");
+        setWorkflowStage("caseDetails");
         setLinkError("");
         setMissingDataTypes([]);
     };
@@ -3246,112 +3232,26 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         );
     };
 
-    if (!isLinkedRoute && workflowStage === "caseSelection") {
+    if (!isLinkedRoute && workflowStage === "caseDetails") {
+        return <FdrCaseDetailsStep />;
+    }
+
+    if (workflowStage === "fdrUpload" && selectedCase && selectedCaseData) {
         return (
-            <div className="max-w-6xl mx-auto space-y-8">
-                <header className="space-y-2">
-                    <p className="text-sm font-semibold text-emerald-600">FDR Module</p>
-                    <h1 className="text-3xl font-bold text-gray-900">
-                        Select a Case to Analyze Flight Data
-                    </h1>
-                    <p className="text-gray-600 max-w-3xl">
-                        Choose the investigation file whose flight data recorder stream you want to explore. Once selected, the
-                        system will load available parameters, trend charts, and anomaly detection workflows.
-                    </p>
-                </header>
-
-                {(recentCasesError || linkError) && (
-                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                        {linkError || recentCasesError}
-                    </div>
-                )}
-
-                {isRecentLoading && recentCases.length === 0 && (
-                    <div className="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-500">
-                        Loading recent cases...
-                    </div>
-                )}
-
-                <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-                    {caseSelectionOptions.map((flightCase) => {
-                        const isActive = selectedCase?.id === flightCase.id;
-                        return (
-                            <button
-                                key={flightCase.id}
-                                type="button"
-                                onClick={() => {
-                                    setSelectedCase(flightCase);
-                                    setLinkError("");
-                                    setMissingDataTypes([]);
-                                }}
-                                className={`text-left rounded-2xl border transition shadow-sm hover:-translate-y-0.5 hover:shadow-md focus:outline-none focus:ring-4 focus:ring-emerald-100 ${
-                                    isActive ? "border-emerald-300 bg-emerald-50" : "border-gray-200 bg-white"
-                                }`}
-                            >
-                                <div className="p-6 space-y-4">
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-xs uppercase tracking-wide text-gray-400">Case ID</span>
-                                        <span className="text-sm font-semibold text-emerald-600">{flightCase.date}</span>
-                                    </div>
-                                    <div>
-                                        <p className="text-sm font-semibold text-gray-800">{flightCase.id}</p>
-                                        <h2 className="mt-1 text-xl font-bold text-gray-900">{flightCase.title}</h2>
-                                    </div>
-                                    <p className="text-sm text-gray-600">{flightCase.summary}</p>
-                                    <div className="flex items-center justify-between text-sm">
-                                        <span className="text-gray-500">Aircraft</span>
-                                        <span className="font-medium text-gray-800">{flightCase.aircraft}</span>
-                                    </div>
-                                    {isActive && (
-                                        <div className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
-                                            <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                                            Selected case
-                                        </div>
-                                    )}
-                                </div>
-                            </button>
-                        );
-                    })}
-
-                    <button
-                        type="button"
-                        onClick={handleNavigateToCases}
-                        className="text-left rounded-2xl border-2 border-dashed border-emerald-200 bg-white transition shadow-sm hover:-translate-y-0.5 hover:shadow-md focus:outline-none focus:ring-4 focus:ring-emerald-100"
-                    >
-                        <div className="p-6 space-y-4">
-                            <div className="space-y-1">
-                                <span className="text-xs uppercase tracking-wide text-emerald-600">
-                                    Need a different investigation?
-                                </span>
-                                <h2 className="text-xl font-bold text-gray-900">Browse older cases</h2>
-                            </div>
-                            <p className="text-sm text-gray-600">
-                                Go to the Cases page to select from the full archive, then choose the analysis module you need.
-                            </p>
-                            <span className="inline-flex items-center gap-2 text-sm font-semibold text-emerald-600">
-                                Go to Cases
-                                <ChevronRight className="w-4 h-4" />
-                            </span>
-                        </div>
-                    </button>
-                </div>
-
-                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                    <div className="space-y-1 text-sm text-gray-500">
-                        <p>Select a case to detect anomalies in FDR data.</p>
-                    </div>
-                    <button
-                        type="button"
-                        disabled={!selectedCase}
-                        onClick={() => selectedCase && setWorkflowStage("analysis")}
-                        className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:bg-emerald-200"
-                    >
-                        Continue to analysis
-                    </button>
-                </div>
-        </div>
-    );
-}
+            <FdrUploadStep
+                caseNumber={selectedCase.id}
+                caseData={selectedCaseData}
+                bannerMessage={linkError}
+                onUploaded={(updated) => {
+                    setSelectedCaseData(updated);
+                    setSelectedCase(buildCasePreview(updated));
+                    setLinkError("");
+                    setMissingDataTypes([]);
+                    setWorkflowStage("analysis");
+                }}
+            />
+        );
+    }
 
     if (workflowStage === "analysisChoice") {
         const latestRun =
@@ -5284,6 +5184,16 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
     return (
         <div className="max-w-7xl mx-auto space-y-6">
+            <FdrPhaseStepper
+                currentPhase="dataAnalysis"
+                onPhaseClick={(key) => {
+                    if (key === "details") {
+                        navigate("/cases/fdr", { state: { editCaseNumber: caseNumber || selectedCase?.id } });
+                    } else if (key === "upload") {
+                        setWorkflowStage("fdrUpload");
+                    }
+                }}
+            />
             <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                 <div>
                     <h1 className="text-3xl font-bold text-gray-900">FDR Module</h1>

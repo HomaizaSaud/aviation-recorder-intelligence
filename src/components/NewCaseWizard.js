@@ -25,7 +25,6 @@ const initialCaseInfo = {
   caseName: '',
   occurrenceDate: '',
   summary: '',
-  tags: '',
 };
 
 const initialInvestigator = {
@@ -375,10 +374,6 @@ const NewCaseWizard = ({ isOpen, onClose, onSubmit, isSubmitting = false, errorM
 
   const buildPayload = ({ attachments, analyses, module, status, timeline }) => {
     const normalizedDate = normalizeDate(caseInfo.occurrenceDate || aircraft.dateOfFlight);
-    const tagsArray = caseInfo.tags
-      .split(',')
-      .map((tag) => tag.trim())
-      .filter(Boolean);
 
     return {
       caseNumber: caseInfo.caseNumber,
@@ -393,7 +388,6 @@ const NewCaseWizard = ({ isOpen, onClose, onSubmit, isSubmitting = false, errorM
       date: normalizedDate,
       location: aircraft.location,
       aircraftType: aircraft.aircraftType,
-      tags: tagsArray,
       analyses,
       attachments,
       timeline,
@@ -554,13 +548,6 @@ const NewCaseWizard = ({ isOpen, onClose, onSubmit, isSubmitting = false, errorM
           type="date"
           value={caseInfo.occurrenceDate}
           onChange={(value) => setCaseInfo((prev) => ({ ...prev, occurrenceDate: value }))}
-        />
-        <TextField
-          id="case-tags"
-          label="Tags"
-          value={caseInfo.tags}
-          onChange={(value) => setCaseInfo((prev) => ({ ...prev, tags: value }))}
-          placeholder="Runway excursion, Weather"
         />
       </div>
       <TextAreaField
