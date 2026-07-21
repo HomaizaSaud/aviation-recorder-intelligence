@@ -384,12 +384,13 @@ router.post('/:caseNumber/report-exports/generate', async (req, res, next) => {
     const generatedAt = new Date().toISOString();
     const extension = format === 'docx' ? 'docx' : 'pdf';
     const fileName = `${caseData.caseNumber}_Report_${formatFileTimestamp(generatedAt)}.${extension}`;
-    const reportData = buildReportData({
+    const reportData = await buildReportData({
       caseData,
       selectedSections: resolvedSections,
       fdrRun,
       notes,
       generatedAt,
+      fdrReportData: payload.fdr_report_data || null,
     });
     const { reportBuffer, contentType, formatLabel } =
       format === 'docx'

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Trash2 } from "lucide-react";
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, Polyline, CircleMarker } from 'react-leaflet';
 import {
@@ -15,17 +16,18 @@ import {
     Legend,
 } from "recharts";
 import NotesPanel from "../components/NotesPanel";
-import FdrCaseDetailsStep from "../components/FdrCaseDetailsStep";
-import FdrUploadStep from "../components/FdrUploadStep";
-import FdrPhaseStepper from "../components/FdrPhaseStepper";
 import { fetchCaseByNumber, updateCase } from "../api/cases";
 import { runFdrAnomalyDetection, fetchFdrSegments, fetchFdrPhases, fetchFdrOccurrence, saveFdrOccurrence, fetchFdrRules, fetchFdrCorrections, addFdrCorrection, deleteFdrCorrection } from "../api/anomaly";
 import { useAuth } from "../hooks/useAuth";
 import { buildCasePreview } from "../utils/caseDisplay";
-import { evaluateModuleReadiness } from "../utils/analysisAvailability";
+import { evaluateModuleReadiness, getCaseDataAvailability } from "../utils/analysisAvailability";
 import { fetchAttachmentFromObjectStore } from "../utils/storage";
 import { fdrParameterMap, fdrParameterConfig } from "../config/fdr-parameters";
 import { createTimelineEntry, resolveActor } from "../utils/timeline";
+import FdrWizardStepper from "../components/FdrWizardStepper";
+import FdrCaseDetailsStep from "../components/FdrCaseDetailsStep";
+import FdrUploadStep from "../components/FdrUploadStep";
+import FdrReportStep from "../components/FdrReportStep";
 
 const colorPalette = [
     "#059669",
@@ -573,6 +575,14 @@ const formatPhaseDuration = (seconds) => {
     return s > 0 ? `${m}m ${s}s` : `${m}m`;
 };
 
+const parseMinutesSecondsToSeconds = (value) => {
+    const match = /^(\d{1,3}):([0-5]?\d)$/.exec(String(value ?? "").trim());
+    if (!match) return null;
+    const minutes = Number(match[1]);
+    const seconds = Number(match[2]);
+    return minutes * 60 + seconds;
+};
+
 const formatAnalysisTimestamp = (value) => {
     if (!value) {
         return "—";
@@ -1038,6 +1048,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     const [correctionsLogOpen, setCorrectionsLogOpen] = useState(false);
     const [deleteConfirmId, setDeleteConfirmId] = useState(null);
     const [savedToast, setSavedToast] = useState(null);
+    const [manualFindingForm, setManualFindingForm] = useState(null);
+    const [manualFindingError, setManualFindingError] = useState("");
     const [dismissedOpen, setDismissedOpen] = useState(false);
     const [phaseEditMode, setPhaseEditMode] = useState(false);
     const [phaseCorrectionForm, setPhaseCorrectionForm] = useState({});
@@ -1056,6 +1068,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
     );
     const [analysisEntryChoice, setAnalysisEntryChoice] = useState(null);
     const pendingRunRef = useRef(null);
+    // ── Wizard navigation (Step 1–6) ─────────────────────────────────────────
+    const [wizardStep, setWizardStep] = useState(1);
+    const [caseDetailsConfirmed, setCaseDetailsConfirmed] = useState(false);
     const detectionScopeLabel =
         availableParameters.length > 0
             ? "All numeric parameters"
@@ -1228,13 +1243,6 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
         return groups.filter((group) => group.parameters.length > 0);
     }, [filteredParameters, parameterDisplayMap]);
-    const analyzedParameters = useMemo(() => {
-        const labels = (availableParameters || []).map((parameter) => {
-            const meta = parameterDisplayMap[parameter];
-            return meta?.label || parameter;
-        });
-        return Array.from(new Set(labels));
-    }, [availableParameters, parameterDisplayMap]);
     const segments = useMemo(() => {
         if (!anomalyResult) {
             return [];
@@ -1665,6 +1673,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         if (selectedCase?.id === caseNumber) {
             lastLinkedCaseRef.current = caseNumber;
             setWorkflowStage((prev) => (prev === "caseDetails" ? "analysis" : prev));
+            setWizardStep(1);
+            setCaseDetailsConfirmed(false);
             return;
         }
 
@@ -1709,6 +1719,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 lastLinkedCaseRef.current = caseNumber;
                 setLinkError("");
                 setMissingDataTypes([]);
+                setWizardStep(1);
+                setCaseDetailsConfirmed(false);
             })
             .catch((err) => {
                 if (!isMounted) {
@@ -1726,6 +1738,16 @@ export default function FDR({ caseNumber: propCaseNumber }) {
             isMounted = false;
         };
     }, [caseNumber, navigate, selectedCase, isLinkedRoute]);
+
+    // Defensive: whichever path lands us on the shared Step 3/4 analysis view
+    // (direct link to a case that already has FDR data, resuming, etc.), make
+    // sure the wizard is actually on Step 3+ instead of showing a blank body.
+    useEffect(() => {
+        if (workflowStage === "analysis" && wizardStep < 3) {
+            setWizardStep(3);
+            setCaseDetailsConfirmed(true);
+        }
+    }, [workflowStage, wizardStep]);
 
     useEffect(() => {
         if (!selectedCase?.source) {
@@ -1998,6 +2020,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         setWorkflowStage("caseDetails");
         setLinkError("");
         setMissingDataTypes([]);
+        setWizardStep(1);
+        setCaseDetailsConfirmed(false);
     };
 
     const handleViewLatestResults = () => {
@@ -2010,11 +2034,24 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         }
         setAnalysisEntryChoice("view");
         setWorkflowStage("results");
+        setCaseDetailsConfirmed(true);
+        setWizardStep(5);
     };
 
     const handleStartNewAnalysis = () => {
         setAnalysisEntryChoice("new");
         setWorkflowStage("analysis");
+        setCaseDetailsConfirmed(true);
+        setWizardStep(3);
+    };
+
+    const handleStepperClick = (step) => {
+        setWizardStep(step);
+        if (step <= 4) {
+            setWorkflowStage("analysis");
+        } else if (step === 5) {
+            setWorkflowStage("results");
+        }
     };
 
     const handleToggleGroup = (groupKey) => {
@@ -2698,15 +2735,102 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         }
     }, [caseNumber]);
 
+    const handleSaveManualFinding = useCallback(async () => {
+        const form = manualFindingForm || {};
+        const title = (form.title || '').trim();
+        const startSeconds = parseMinutesSecondsToSeconds(form.startTime);
+        const endSeconds = parseMinutesSecondsToSeconds(form.endTime);
+
+        if (!title) {
+            setManualFindingError('Title is required.');
+            return;
+        }
+        if (startSeconds == null || endSeconds == null) {
+            setManualFindingError('Enter both times as MM:SS.');
+            return;
+        }
+        if (endSeconds < startSeconds) {
+            setManualFindingError('End time must be at or after start time.');
+            return;
+        }
+        if (!form.phase) {
+            setManualFindingError('Select a flight phase.');
+            return;
+        }
+        if (!form.severity) {
+            setManualFindingError('Select a severity.');
+            return;
+        }
+
+        const correction = {
+            id: crypto.randomUUID(),
+            type: 'manual_finding',
+            target_id: `manual-${Date.now()}`,
+            original_value: {},
+            corrected_value: {
+                title,
+                start_time: startSeconds,
+                end_time: endSeconds,
+                phase: form.phase,
+                severity: form.severity,
+                parameters: (form.parameters || '')
+                    .split(',')
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+                description: (form.description || '').trim(),
+            },
+            investigator: investigatorName,
+            timestamp: new Date().toISOString(),
+        };
+
+        try {
+            const updated = await addFdrCorrection(caseNumber, correction);
+            setCorrections(Array.isArray(updated) ? updated : []);
+            setManualFindingForm(null);
+            setManualFindingError('');
+            setSavedToast('Saved');
+            setTimeout(() => setSavedToast(null), 2000);
+        } catch (err) {
+            console.error('Failed to save manual finding:', err);
+            setManualFindingError(err?.message || 'Unable to save this finding.');
+        }
+    }, [manualFindingForm, caseNumber, investigatorName]);
+
     const extraSegmentsOmitted = anomalyResult?.summary?.extra_segments_omitted ?? 0;
 
     // Task 10 — merge AI segments with rule-based findings.
+    // Task 16 — investigator-authored manual findings, folded into the findings list.
+    const manualFindingSegments = useMemo(
+        () =>
+            corrections
+                .filter((c) => c.type === 'manual_finding')
+                .map((c) => {
+                    const v = c.corrected_value || {};
+                    return {
+                        start_time: v.start_time,
+                        end_time: v.end_time,
+                        severity: v.severity,
+                        detection_source: "manual",
+                        top_drivers: [],
+                        manual: true,
+                        manual_title: v.title,
+                        manual_phase: v.phase,
+                        manual_parameters: Array.isArray(v.parameters) ? v.parameters : [],
+                        manual_description: v.description || '',
+                        manual_investigator: c.investigator,
+                        manual_timestamp: c.timestamp,
+                        correctionId: c.id,
+                    };
+                }),
+        [corrections]
+    );
+
     const mergedSegments = useMemo(() => {
         const OVERLAP_GAP = 30; // seconds — same as SEGMENT_GAP_SECONDS in Python
         const aiSegs = segments.map((s) => ({ ...s, detection_source: "ai" }));
         const ruleFindings = rulesResult?.findings || [];
 
-        if (!ruleFindings.length) return aiSegs;
+        if (!ruleFindings.length) return [...aiSegs, ...manualFindingSegments];
 
         // Work on a mutable copy so we can annotate matched AI segments.
         const merged = aiSegs.map((s) => ({ ...s }));
@@ -2740,12 +2864,13 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         });
 
         const _SEV = { high: 3, med: 2, low: 1 };
-        return [...merged, ...unmatchedRules].sort(
+        const sorted = [...merged, ...unmatchedRules].sort(
             (a, b) =>
                 (_SEV[b.severity] || 0) - (_SEV[a.severity] || 0) ||
                 (b.score_peak || 0) - (a.score_peak || 0)
         );
-    }, [segments, rulesResult]);
+        return [...sorted, ...manualFindingSegments];
+    }, [segments, rulesResult, manualFindingSegments]);
 
     const filteredSegments = useMemo(() => {
         let result = mergedSegments;
@@ -2779,6 +2904,103 @@ export default function FDR({ caseNumber: propCaseNumber }) {
         ),
         [filteredSegments, corrections]
     );
+
+    // ── Step 6 — FDR Analysis Report payload ─────────────────────────────────
+    const fdrReportData = useMemo(() => {
+        if (!anomalyResult) {
+            return null;
+        }
+
+        const phaseBreakdownMap = anomalyResult?.summary?.phase_breakdown || {};
+        const phaseBreakdown = PHASE_ORDER.filter((phase) => phaseBreakdownMap[phase]).map((phase) => ({
+            phase,
+            ...phaseBreakdownMap[phase],
+        }));
+
+        const timelinePhases = Array.isArray(flightPhases) ? flightPhases : [];
+        const phasesDetected = timelinePhases.length
+            ? Array.from(new Set(timelinePhases.map((p) => p.phase)))
+            : phaseBreakdown.map((row) => row.phase);
+        const durationLabel = timelinePhases.length
+            ? formatPhaseDuration(
+                  Math.max(...timelinePhases.map((p) => p.end_time)) -
+                      Math.min(...timelinePhases.map((p) => p.start_time))
+              )
+            : null;
+
+        const altitudeRow = [...parameterTableRows]
+            .filter((row) => /altitude/i.test(row.parameter))
+            .sort((a, b) => (b.max ?? -Infinity) - (a.max ?? -Infinity))[0];
+        const maxAltitudeLabel = altitudeRow ? `${altitudeRow.max} ${altitudeRow.unit}`.trim() : null;
+
+        const severityCounts = { high: 0, med: 0, low: 0 };
+        activeSegments.forEach((segment) => {
+            const severity = String(segment?.severity ?? 'low').toLowerCase();
+            if (severityCounts[severity] != null) {
+                severityCounts[severity] += 1;
+            }
+        });
+
+        const topFindings = activeSegments.slice(0, 5).map((segment) => {
+            if (segment.manual) {
+                return {
+                    parameter: segment.manual_parameters?.length
+                        ? segment.manual_parameters.join(', ')
+                        : segment.manual_title || '—',
+                    deviation: '—',
+                    phase: segment.manual_phase || '—',
+                    type: 'Manual',
+                };
+            }
+            const drivers = resolveSegmentDrivers(segment, 1);
+            const topDriver = drivers[0];
+            const detSrc = segment?.detection_source || 'ai';
+            return {
+                parameter: topDriver?.label || topDriver?.param || '—',
+                deviation: topDriver ? getDriverDeviationLabel(topDriver) || '—' : '—',
+                phase: getSegmentPhaseLabel(segment) || '—',
+                type: detSrc === 'both' ? 'AI + Rule' : detSrc === 'rules' ? 'Rule' : 'AI',
+            };
+        });
+
+        return {
+            flightSummary: {
+                durationLabel,
+                maxAltitudeLabel,
+                phasesDetected,
+            },
+            anomalySummary: {
+                total: activeSegments.length,
+                high: severityCounts.high,
+                med: severityCounts.med,
+                low: severityCounts.low,
+            },
+            topFindings,
+            phaseBreakdown,
+        };
+    }, [
+        anomalyResult,
+        flightPhases,
+        parameterTableRows,
+        activeSegments,
+        resolveSegmentDrivers,
+        getDriverDeviationLabel,
+        getSegmentPhaseLabel,
+    ]);
+
+    // ── Wizard step reachability ──────────────────────────────────────────────
+    const maxReachableStep = useMemo(() => {
+        if (!selectedCase || !caseDetailsConfirmed) {
+            return 1;
+        }
+        if (!getCaseDataAvailability(selectedCase.source).hasFdr) {
+            return 2;
+        }
+        if (!anomalyResult) {
+            return 3;
+        }
+        return 6;
+    }, [selectedCase, caseDetailsConfirmed, anomalyResult]);
 
     useEffect(() => {
         if (!pendingScrollToChartsRef.current) return;
@@ -3248,6 +3470,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     setLinkError("");
                     setMissingDataTypes([]);
                     setWorkflowStage("analysis");
+                    setCaseDetailsConfirmed(true);
+                    setWizardStep(3);
                 }}
             />
         );
@@ -3301,7 +3525,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
     if (workflowStage === "detectionRunning") {
         return (
-            <div className="max-w-4xl mx-auto flex flex-col items-center justify-center py-24 text-center space-y-6">
+            <div className="max-w-4xl mx-auto space-y-6">
+                <FdrWizardStepper currentStep={3} maxReachableStep={maxReachableStep} onStepClick={handleStepperClick} />
+                <div className="flex flex-col items-center justify-center py-16 text-center space-y-6">
                 <div className="flex h-24 w-24 items-center justify-center rounded-full bg-emerald-50">
                     <div className="h-12 w-12 animate-spin rounded-full border-4 border-emerald-200 border-t-emerald-600" />
                 </div>
@@ -3325,13 +3551,16 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         completes.
                     </p>
                 </div>
+                </div>
             </div>
         );
     }
 
     if (workflowStage === "detectionError") {
         return (
-            <div className="max-w-4xl mx-auto flex flex-col items-center justify-center py-24 text-center space-y-6">
+            <div className="max-w-4xl mx-auto space-y-6">
+                <FdrWizardStepper currentStep={3} maxReachableStep={maxReachableStep} onStepClick={handleStepperClick} />
+                <div className="flex flex-col items-center justify-center py-16 text-center space-y-6">
                 <div className="flex h-20 w-20 items-center justify-center rounded-full bg-amber-50 text-amber-600">
                     <svg
                         xmlns="http://www.w3.org/2000/svg"
@@ -3374,13 +3603,16 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         Back to case
                     </button>
                 </div>
+                </div>
             </div>
         );
     }
 
     if (workflowStage === "detectionComplete") {
         return (
-            <div className="max-w-4xl mx-auto flex flex-col items-center justify-center py-24">
+            <div className="max-w-4xl mx-auto space-y-6">
+                <FdrWizardStepper currentStep={3} maxReachableStep={maxReachableStep} onStepClick={handleStepperClick} />
+                <div className="flex flex-col items-center justify-center py-12">
                 <div className="w-full rounded-3xl bg-white p-12 text-center shadow-xl border border-emerald-100">
                     <div className="mx-auto mb-6 flex h-24 w-24 items-center justify-center rounded-full bg-emerald-50">
                         <svg
@@ -3416,234 +3648,46 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     <div className="mt-10 flex flex-wrap justify-center gap-4">
                         <button
                             type="button"
-                            onClick={() => setWorkflowStage("results")}
+                            onClick={() => {
+                                setWorkflowStage("results");
+                                setWizardStep(5);
+                            }}
                             className="rounded-xl bg-emerald-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition"
                         >
                             View Results
                         </button>
                         <button
                             type="button"
-                            onClick={() => setWorkflowStage("analysis")}
+                            onClick={() => {
+                                setWorkflowStage("analysis");
+                                setWizardStep(4);
+                            }}
                             className="rounded-xl border border-gray-200 px-6 py-2 text-sm font-semibold text-gray-700 transition hover:border-emerald-200 hover:text-emerald-600"
                         >
                             Adjust parameters
                         </button>
                     </div>
                 </div>
+                </div>
             </div>
         );
     }
 
-    if (workflowStage === "export") {
-        if (!anomalyResult) {
-            return (
-                <div className="max-w-4xl mx-auto flex flex-col items-center justify-center py-24 text-center space-y-4">
-                    <div className="rounded-full bg-emerald-50 p-4 text-emerald-600">
-                        <svg
-                            xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="2"
-                            className="h-10 w-10"
-                        >
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2" />
-                            <circle cx="12" cy="12" r="9" />
-                        </svg>
-                    </div>
-                    <h2 className="text-2xl font-semibold text-gray-900">
-                        FDR summary unavailable
-                    </h2>
-                    <p className="text-sm text-gray-600 max-w-md">
-                        Run anomaly detection for this case to populate the FDR summary.
-                    </p>
-                    <button
-                        type="button"
-                        onClick={() => setWorkflowStage("analysis")}
-                        className="rounded-xl bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm"
-                    >
-                        Back to data overview
-                    </button>
-                </div>
-            );
-        }
-
-        const investigatorSummary =
-            selectedCase?.source?.investigatorSummary ||
-            selectedCase?.source?.investigator_summary ||
-            "";
-
+    if (wizardStep === 6 && selectedCase) {
         return (
-            <div className="max-w-5xl mx-auto space-y-6">
-                <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
-                    <div>
-                        <p className="text-sm uppercase tracking-[0.4em] text-emerald-500">
-                            FDR Module
-                        </p>
-                        <h1 className="text-3xl font-bold text-gray-900">FDR Summary</h1>
-                        <p className="text-gray-600">
-                            Report-ready summary for {selectedCase?.id} · {selectedCase?.title}
-                        </p>
-                        {analysisTimestamp && (
-                            <p className="mt-2 text-xs text-gray-500">
-                                Last analyzed: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
-                            </p>
-                        )}
-                    </div>
-                    <div className="flex flex-wrap items-center gap-3">
-                        <button
-                            type="button"
-                            onClick={() => setWorkflowStage("results")}
-                            className="rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-700 hover:border-emerald-200 hover:text-emerald-600"
-                        >
-                            Back to results
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                if (selectedCase?.id) {
-                                    navigate(
-                                        `/reports?case=${encodeURIComponent(
-                                            selectedCase.id
-                                        )}&sections=fdrMetrics`
-                                    );
-                                }
-                            }}
-                            className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm"
-                        >
-                            Generate Investigation Report
-                        </button>
-                    </div>
-                </header>
-
-                {caseSummary && (
-                    <section className="rounded-3xl bg-white p-6 border border-gray-200">
-                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                            <div>
-                                <h2 className="text-lg font-semibold text-gray-900">
-                                    Case Summary
-                                </h2>
-                                <p className="text-sm text-gray-500">
-                                    Copy-ready narrative for export.
-                                </p>
-                            </div>
-                            <button
-                                type="button"
-                                onClick={handleCopyCaseSummary}
-                                className="inline-flex items-center justify-center rounded-lg border border-emerald-200 px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
-                            >
-                                {caseSummaryCopied ? "Copied" : "Copy"}
-                            </button>
-                        </div>
-                        <p className="mt-4 text-sm text-gray-700">{caseSummary.paragraph}</p>
-                        <ul className="mt-4 space-y-1 text-sm text-gray-700">
-                            {caseSummary.bullets.map((item) => (
-                                <li key={item} className="flex items-start gap-2">
-                                    <span className="mt-1 h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                                    <span>{item}</span>
-                                </li>
-                            ))}
-                        </ul>
-                    </section>
-                )}
-
-                {investigatorSummary && (
-                    <section className="rounded-3xl bg-white p-6 border border-gray-200">
-                        <div className="flex flex-col gap-2">
-                            <h2 className="text-lg font-semibold text-gray-900">
-                                Investigator Summary
-                            </h2>
-                            <p className="text-sm text-gray-500">
-                                Saved narrative included in exports.
-                            </p>
-                        </div>
-                        <p className="mt-4 text-sm text-gray-700 whitespace-pre-wrap">
-                            {investigatorSummary}
-                        </p>
-                    </section>
-                )}
-
-                <section className="rounded-3xl bg-white p-6 border border-gray-200 space-y-5">
-                    <div>
-                        <h2 className="text-lg font-semibold text-gray-900">
-                            Analysis Details
-                        </h2>
-                        <p className="text-sm text-gray-500">
-                            Investigator-ready overview of parameters and segment attribution.
-                        </p>
-                    </div>
-                    <div>
-                        <p className="text-xs uppercase tracking-wide text-gray-500">
-                            Parameters analyzed
-                        </p>
-                        {analyzedParameters.length > 0 ? (
-                            <div className="mt-2 flex flex-wrap gap-2">
-                                {analyzedParameters.map((parameter) => (
-                                    <span
-                                        key={parameter}
-                                        className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600"
-                                    >
-                                        {parameter}
-                                    </span>
-                                ))}
-                            </div>
-                        ) : (
-                            <p className="mt-2 text-sm text-gray-500">No parameters listed.</p>
-                        )}
-                    </div>
-                    <div>
-                        <p className="text-xs uppercase tracking-wide text-gray-500">
-                            Top contributing parameters
-                        </p>
-                        {topParameterPreview.length > 0 ? (
-                            <ul className="mt-2 space-y-1 text-sm text-gray-700">
-                                {topParameterPreview.map((item) => (
-                                    <li
-                                        key={`${item.name}-${item.count}`}
-                                        className="flex items-center justify-between"
-                                    >
-                                        <span className="font-medium">{item.name}</span>
-                                        <span className="text-xs text-gray-500">
-                                            {item.count} {item.count === 1 ? "segment" : "segments"}
-                                        </span>
-                                    </li>
-                                ))}
-                            </ul>
-                        ) : (
-                            <p className="mt-2 text-sm text-gray-500">
-                                No contributing parameters reported.
-                            </p>
-                        )}
-                    </div>
-                    <div>
-                        <p className="text-xs uppercase tracking-wide text-gray-500">
-                            Segment counts per parameter
-                        </p>
-                        {allTopParameters.length > 0 ? (
-                            <div className="mt-2 grid gap-2 md:grid-cols-2">
-                                {allTopParameters.map((item) => (
-                                    <div
-                                        key={`${item.name}-${item.count}-count`}
-                                        className="flex items-center justify-between rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700"
-                                    >
-                                        <span>{item.name}</span>
-                                        <span className="font-semibold text-gray-900">
-                                            {item.count}
-                                        </span>
-                                    </div>
-                                ))}
-                            </div>
-                        ) : (
-                            <p className="mt-2 text-sm text-gray-500">
-                                Segment counts not available for this run.
-                            </p>
-                        )}
-                    </div>
-                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                        Unsupervised behavioral anomaly detection; results are suggestive and require investigator review.
-                    </div>
-                </section>
-            </div>
+            <FdrReportStep
+                caseNumber={caseNumber}
+                selectedCase={selectedCase}
+                fdrReportData={fdrReportData}
+                corrections={corrections}
+                investigatorName={investigatorName}
+                maxReachableStep={maxReachableStep}
+                onStepClick={handleStepperClick}
+                onBack={() => {
+                    setWorkflowStage("results");
+                    setWizardStep(5);
+                }}
+            />
         );
     }
 
@@ -3670,7 +3714,10 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     </p>
                     <button
                         type="button"
-                        onClick={() => setWorkflowStage("analysis")}
+                        onClick={() => {
+                            setWorkflowStage("analysis");
+                            setWizardStep(4);
+                        }}
                         className="rounded-xl bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm"
                     >
                         Back to data overview
@@ -3684,6 +3731,26 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
         return (
             <div className="max-w-7xl mx-auto space-y-6">
+                <FdrWizardStepper currentStep={5} maxReachableStep={maxReachableStep} onStepClick={handleStepperClick} />
+                <div className="flex justify-between">
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setWorkflowStage("analysis");
+                            setWizardStep(4);
+                        }}
+                        className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-5 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50"
+                    >
+                        Back: Normal Parameters
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setWizardStep(6)}
+                        className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700"
+                    >
+                        Next: Analysis Report
+                    </button>
+                </div>
                 <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
                     <div>
                         <p className="text-sm uppercase tracking-[0.4em] text-emerald-500">
@@ -3703,22 +3770,6 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                 Last analyzed: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
                             </p>
                         )}
-                    </div>
-                    <div className="flex flex-wrap items-center gap-3">
-                        <button
-                            type="button"
-                            onClick={() => setWorkflowStage("analysis")}
-                            className="rounded-xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-700 hover:border-emerald-200 hover:text-emerald-600"
-                        >
-                            Back to data overview
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => setWorkflowStage("export")}
-                            className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm"
-                        >
-                            View FDR Summary
-                        </button>
                     </div>
                 </header>
 
@@ -4339,7 +4390,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                 const timeBounds = resolveSegmentTimeBounds(segment);
                                 const interpretation = resolveSegmentInterpretation(segment);
 
-                                const phaseLabel = getSegmentPhaseLabel(segment);
+                                const phaseLabel = segment.manual ? segment.manual_phase : getSegmentPhaseLabel(segment);
                                 const topTwoDrivers = topDrivers.slice(0, 2);
                                 const scorePeak =
                                     segment?.score_peak != null
@@ -4347,7 +4398,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         : null;
                                 const detSrc = segment?.detection_source || "ai";
                                 const srcBadge =
-                                    detSrc === "both"
+                                    detSrc === "manual"
+                                        ? { label: "Manual", cls: "bg-gray-200 text-gray-700 border border-gray-300" }
+                                        : detSrc === "both"
                                         ? { label: "AI + Rule", cls: "bg-rose-100 text-rose-700 border border-rose-200" }
                                         : detSrc === "rules"
                                         ? { label: "Rule", cls: "bg-purple-100 text-purple-700 border border-purple-200" }
@@ -4411,7 +4464,18 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                                         </span>
                                                     )}
                                                 </div>
-                                                {topTwoDrivers.length > 0 && (
+                                                {segment.manual && (
+                                                    <p className="text-xs font-medium text-gray-700">
+                                                        {segment.manual_title}
+                                                    </p>
+                                                )}
+                                                {segment.manual && (
+                                                    <p className="text-xs text-gray-500">
+                                                        Investigator: {segment.manual_investigator || investigatorName}
+                                                        {segment.manual_timestamp && ` · ${new Date(segment.manual_timestamp).toLocaleString()}`}
+                                                    </p>
+                                                )}
+                                                {!segment.manual && topTwoDrivers.length > 0 && (
                                                     <p className="text-xs text-gray-600">
                                                         {topTwoDrivers.map((d, di) => {
                                                             const dev = getDriverDeviationLabel(d);
@@ -4485,8 +4549,43 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                             </button>
                                         </div>
 
+                                        {/* Task 16 — Manual finding: delete only, no false-positive/severity/flag */}
+                                        {segment.manual && (
+                                            <div className="flex items-center gap-2 px-4 pb-3 -mt-2">
+                                                {deleteConfirmId === segment.correctionId ? (
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-xs text-red-600">Delete this finding?</span>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleDeleteCorrection(segment.correctionId)}
+                                                            className="rounded-lg bg-red-500 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-red-600"
+                                                        >
+                                                            Yes, delete
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setDeleteConfirmId(null)}
+                                                            className="rounded-lg border border-gray-200 px-2.5 py-1 text-xs text-gray-500 transition hover:bg-gray-50"
+                                                        >
+                                                            Cancel
+                                                        </button>
+                                                    </div>
+                                                ) : (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setDeleteConfirmId(segment.correctionId)}
+                                                        className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-500 transition hover:border-red-200 hover:text-red-600"
+                                                        title="Delete this manual finding"
+                                                    >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                        Delete
+                                                    </button>
+                                                )}
+                                            </div>
+                                        )}
+
                                         {/* Task 15 — Correction action buttons */}
-                                        {!corrForm.mode && (
+                                        {!segment.manual && !corrForm.mode && (
                                             <div className="flex items-center gap-2 px-4 pb-3 -mt-2">
                                                 <button
                                                     type="button"
@@ -4513,7 +4612,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                         )}
 
                                         {/* Task 15 — Inline correction form */}
-                                        {corrForm.mode && (
+                                        {!segment.manual && corrForm.mode && (
                                             <div className="border-t border-gray-100 bg-gray-50 px-4 py-3 space-y-2">
                                                 <p className="text-xs font-semibold text-gray-700">
                                                     {corrForm.mode === 'fp' ? 'Mark as false positive' : corrForm.mode === 'flag' ? 'Add flag' : 'Adjust severity'}
@@ -4570,7 +4669,30 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                             </div>
                                         )}
 
-                                        {isExpanded && (
+                                        {isExpanded && segment.manual && (
+                                            <div className={`border-t px-4 py-4 ${severityTone.evidencePanel}`}>
+                                                <p className="text-xs font-semibold text-gray-700 mb-1">Description</p>
+                                                <p className="text-sm text-gray-700 mb-4 whitespace-pre-wrap">
+                                                    {segment.manual_description || "No description provided."}
+                                                </p>
+                                                <p className="text-xs font-semibold text-gray-700 mb-1">Parameter(s) involved</p>
+                                                {segment.manual_parameters?.length > 0 ? (
+                                                    <div className="flex flex-wrap gap-1.5">
+                                                        {segment.manual_parameters.map((param) => (
+                                                            <span
+                                                                key={param}
+                                                                className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600"
+                                                            >
+                                                                {param}
+                                                            </span>
+                                                        ))}
+                                                    </div>
+                                                ) : (
+                                                    <p className="text-sm text-gray-400">None specified.</p>
+                                                )}
+                                            </div>
+                                        )}
+                                        {isExpanded && !segment.manual && (
                                             <div
                                                 className={`border-t px-4 py-4 ${severityTone.evidencePanel}`}
                                             >
@@ -4891,6 +5013,136 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         )}
                     </div>
 
+                    {/* Task 16 — Add finding manually */}
+                    <div className="mt-4">
+                    {!manualFindingForm ? (
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setManualFindingForm({
+                                    title: '',
+                                    startTime: '',
+                                    endTime: '',
+                                    phase: '',
+                                    severity: '',
+                                    parameters: '',
+                                    description: '',
+                                });
+                                setManualFindingError('');
+                            }}
+                            className="w-full rounded-xl border-2 border-dashed border-gray-200 px-4 py-3 text-sm font-semibold text-gray-500 transition hover:border-emerald-300 hover:text-emerald-600"
+                        >
+                            + Add finding manually
+                        </button>
+                    ) : (
+                        <div className="rounded-xl border border-gray-200 bg-gray-50 p-5 space-y-3">
+                            <p className="text-sm font-semibold text-gray-800">Add finding manually</p>
+                            <div>
+                                <label className="text-xs font-semibold text-gray-500">Title</label>
+                                <input
+                                    type="text"
+                                    value={manualFindingForm.title}
+                                    onChange={(e) => setManualFindingForm((prev) => ({ ...prev, title: e.target.value }))}
+                                    placeholder="e.g. Unusual engine vibration observed"
+                                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                />
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-xs font-semibold text-gray-500">Start time (MM:SS)</label>
+                                    <input
+                                        type="text"
+                                        value={manualFindingForm.startTime}
+                                        onChange={(e) => setManualFindingForm((prev) => ({ ...prev, startTime: e.target.value }))}
+                                        placeholder="12:30"
+                                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-xs font-semibold text-gray-500">End time (MM:SS)</label>
+                                    <input
+                                        type="text"
+                                        value={manualFindingForm.endTime}
+                                        onChange={(e) => setManualFindingForm((prev) => ({ ...prev, endTime: e.target.value }))}
+                                        placeholder="13:15"
+                                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                    />
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-xs font-semibold text-gray-500">Flight phase</label>
+                                    <select
+                                        value={manualFindingForm.phase}
+                                        onChange={(e) => setManualFindingForm((prev) => ({ ...prev, phase: e.target.value }))}
+                                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                    >
+                                        <option value="">Select phase…</option>
+                                        {PHASE_ORDER.map((phase) => (
+                                            <option key={phase} value={phase}>{phase}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs font-semibold text-gray-500">Severity</label>
+                                    <select
+                                        value={manualFindingForm.severity}
+                                        onChange={(e) => setManualFindingForm((prev) => ({ ...prev, severity: e.target.value }))}
+                                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                    >
+                                        <option value="">Select severity…</option>
+                                        <option value="high">High</option>
+                                        <option value="med">Medium</option>
+                                        <option value="low">Low</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-gray-500">Parameter(s) involved</label>
+                                <input
+                                    type="text"
+                                    value={manualFindingForm.parameters}
+                                    onChange={(e) => setManualFindingForm((prev) => ({ ...prev, parameters: e.target.value }))}
+                                    placeholder="e.g. Engine RPM, Vibration"
+                                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-semibold text-gray-500">Description</label>
+                                <textarea
+                                    value={manualFindingForm.description}
+                                    onChange={(e) => setManualFindingForm((prev) => ({ ...prev, description: e.target.value }))}
+                                    placeholder="Investigator observation…"
+                                    rows={3}
+                                    className="mt-1 w-full resize-none rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm"
+                                />
+                            </div>
+                            {manualFindingError && (
+                                <p className="text-xs font-medium text-red-600">{manualFindingError}</p>
+                            )}
+                            <div className="flex justify-end gap-2 pt-1">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setManualFindingForm(null);
+                                        setManualFindingError('');
+                                    }}
+                                    className="rounded-lg border border-gray-200 px-4 py-1.5 text-xs font-semibold text-gray-600 hover:bg-white"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleSaveManualFinding}
+                                    className="rounded-lg bg-emerald-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                                >
+                                    Confirm
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    </div>
+
                     {/* Task 15 — Dismissed findings section (above Rules checked) */}
                     {dismissedSegments.length > 0 && (
                         <section className="rounded-xl border border-gray-200 bg-white shadow-sm">
@@ -5052,9 +5304,9 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                                     </thead>
                                     <tbody className="divide-y divide-gray-50">
                                         {corrections.map((corr) => {
-                                            const typeLabel = corr.type === 'false_positive' ? 'False positive' : corr.type === 'severity_adjustment' ? 'Severity adjusted' : corr.type === 'flag' ? 'Flag' : 'Phase correction';
-                                            const originalStr = corr.type === 'false_positive' ? `severity: ${corr.original_value?.severity ?? '—'}` : corr.type === 'severity_adjustment' ? corr.original_value?.severity ?? '—' : corr.type === 'flag' ? '—' : corr.original_value?.phase ?? '—';
-                                            const correctedStr = corr.type === 'false_positive' ? 'dismissed' : corr.type === 'severity_adjustment' ? corr.corrected_value?.severity ?? '—' : corr.type === 'flag' ? (corr.corrected_value?.flag_type ?? '—').replace(/_/g, ' ') : corr.corrected_value?.phase ?? '—';
+                                            const typeLabel = corr.type === 'false_positive' ? 'False positive' : corr.type === 'severity_adjustment' ? 'Severity adjusted' : corr.type === 'flag' ? 'Flag' : corr.type === 'manual_finding' ? 'Manual finding' : 'Phase correction';
+                                            const originalStr = corr.type === 'false_positive' ? `severity: ${corr.original_value?.severity ?? '—'}` : corr.type === 'severity_adjustment' ? corr.original_value?.severity ?? '—' : corr.type === 'flag' ? '—' : corr.type === 'manual_finding' ? '—' : corr.original_value?.phase ?? '—';
+                                            const correctedStr = corr.type === 'false_positive' ? 'dismissed' : corr.type === 'severity_adjustment' ? corr.corrected_value?.severity ?? '—' : corr.type === 'flag' ? (corr.corrected_value?.flag_type ?? '—').replace(/_/g, ' ') : corr.type === 'manual_finding' ? corr.corrected_value?.title ?? '—' : corr.corrected_value?.phase ?? '—';
                                             const whenStr = corr.timestamp ? new Date(corr.timestamp).toLocaleDateString() : '—';
                                             const isConfirming = deleteConfirmId === corr.id;
                                             return (
@@ -5122,6 +5374,26 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     />
                 </section>
 
+                <div className="flex justify-between">
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setWorkflowStage("analysis");
+                            setWizardStep(4);
+                        }}
+                        className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-5 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50"
+                    >
+                        Back: Normal Parameters
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setWizardStep(6)}
+                        className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700"
+                    >
+                        Next: Analysis Report
+                    </button>
+                </div>
+
                 {/* Task 15 — Saved toast */}
                 {savedToast && (
                     <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg">
@@ -5184,16 +5456,52 @@ export default function FDR({ caseNumber: propCaseNumber }) {
 
     return (
         <div className="max-w-7xl mx-auto space-y-6">
-            <FdrPhaseStepper
-                currentPhase="dataAnalysis"
-                onPhaseClick={(key) => {
-                    if (key === "details") {
-                        navigate("/cases/fdr", { state: { editCaseNumber: caseNumber || selectedCase?.id } });
-                    } else if (key === "upload") {
-                        setWorkflowStage("fdrUpload");
-                    }
-                }}
+            <FdrWizardStepper
+                currentStep={wizardStep === 4 ? 4 : 3}
+                maxReachableStep={maxReachableStep}
+                onStepClick={handleStepperClick}
             />
+            {wizardStep === 3 && (
+                <div className="flex justify-between">
+                    <button
+                        type="button"
+                        onClick={() => setWizardStep(2)}
+                        className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-5 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50"
+                    >
+                        Back: FDR Upload
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setWizardStep(4)}
+                        disabled={!anomalyResult}
+                        className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
+                    >
+                        Next: Normal Parameters
+                    </button>
+                </div>
+            )}
+            {wizardStep === 4 && (
+                <div className="flex justify-between">
+                    <button
+                        type="button"
+                        onClick={() => setWizardStep(3)}
+                        className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-5 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50"
+                    >
+                        Back: Data Analysis
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setWorkflowStage('results');
+                            setWizardStep(5);
+                        }}
+                        disabled={!anomalyResult}
+                        className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
+                    >
+                        Next: Abnormal Parameters
+                    </button>
+                </div>
+            )}
             <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                 <div>
                     <h1 className="text-3xl font-bold text-gray-900">FDR Module</h1>
@@ -5202,69 +5510,11 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         detection for the selected flight case.
                     </p>
                 </div>
-                <div className="flex items-center justify-end gap-4">
-                    <div className="text-right">
-                        <p className="text-sm text-gray-500">Active Case</p>
-                        <p className="text-sm font-semibold text-gray-800">
-                            {selectedCase?.id} · {selectedCase?.title}
-                        </p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        <button
-                            type="button"
-                            onClick={handleChangeCase}
-                            className="rounded-lg border border-gray-200 px-3 py-1 text-xs font-semibold text-gray-600 transition hover:border-emerald-200 hover:text-emerald-600"
-                        >
-                            Change case
-                        </button>
-                        {/* State-aware analysis button */}
-                        {isRunningDetection ? (
-                            <button
-                                type="button"
-                                disabled
-                                className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-xs font-semibold text-gray-400 cursor-not-allowed"
-                            >
-                                <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
-                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                                </svg>
-                                Running...
-                            </button>
-                        ) : anomalyResult && workflowStage === 'analysis' ? (
-                            <>
-                                <button
-                                    type="button"
-                                    onClick={() => setWorkflowStage('results')}
-                                    className="inline-flex items-center gap-2 rounded-lg border border-emerald-500 px-4 py-2 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-50"
-                                >
-                                    View Results
-                                </button>
-                                {analysisTimestamp && (
-                                    <span className="text-xs text-gray-400 ml-2">
-                                        Last run: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
-                                    </span>
-                                )}
-                            </>
-                        ) : anomalyResult && workflowStage === 'results' ? (
-                            <button
-                                type="button"
-                                onClick={handleRunDetection}
-                                disabled={availableParameters.length === 0}
-                                className="inline-flex items-center gap-2 rounded-lg border border-emerald-500 px-4 py-2 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                                Re-run Analysis
-                            </button>
-                        ) : (
-                            <button
-                                type="button"
-                                onClick={handleRunDetection}
-                                disabled={availableParameters.length === 0}
-                                className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
-                            >
-                                Run Analysis
-                            </button>
-                        )}
-                    </div>
+                <div className="text-right">
+                    <p className="text-sm text-gray-500">Active Case</p>
+                    <p className="text-sm font-semibold text-gray-800">
+                        {selectedCase?.id} · {selectedCase?.title}
+                    </p>
                 </div>
             </header>
 
@@ -5279,62 +5529,8 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 </div>
             )}
 
-            <section className="bg-white border border-gray-200 rounded-xl p-6 space-y-5">
-                <div className="space-y-1">
-                    <h2 className="text-lg font-semibold text-gray-900">Anomaly Detection</h2>
-                </div>
-
-                <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-700">
-                    <p className="text-xs uppercase tracking-wide text-gray-500">Current scope</p>
-                    <p className="font-semibold text-gray-800">{detectionScopeLabel}</p>
-                </div>
-
-                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-                    {analysisTitle}
-                </div>
-                {analysisTimestamp && (
-                    <div className="text-xs text-gray-500">
-                        Last analyzed: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
-                    </div>
-                )}
-
-                {anomalyError && (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                        {anomalyError}
-                    </div>
-                )}
-
-                {(isRunningDetection || anomalyResult || anomalyError) && (
-                    <div className="space-y-3">
-                        {isRunningDetection && !anomalyResult && (
-                            <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-                                <svg
-                                    className="h-4 w-4 animate-spin text-emerald-600"
-                                    fill="none"
-                                    viewBox="0 0 24 24"
-                                >
-                                    <circle
-                                        className="opacity-25"
-                                        cx="12"
-                                        cy="12"
-                                        r="10"
-                                        stroke="currentColor"
-                                        strokeWidth="4"
-                                    />
-                                    <path
-                                        className="opacity-75"
-                                        fill="currentColor"
-                                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                                    />
-                                </svg>
-                                Analysing…
-                            </div>
-                        )}
-
-                    </div>
-                )}
-            </section>
-
+            {wizardStep === 3 && (
+            <>
             {/* ── Flight Segment Selector (Task 6) ───────────────────────────────── */}
             {isLoadingSegments && (
                 <div className="rounded-lg border border-emerald-100 bg-emerald-50 px-4 py-2 text-xs text-emerald-700">
@@ -5642,7 +5838,7 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                         </div>
                         {selectedPhaseKey && (
                             <p className="text-xs font-medium" style={{ color: PHASE_COLORS[selectedPhaseKey] }}>
-                                Viewing {selectedPhaseKey} phase — all charts below show only this window.
+                                Viewing {selectedPhaseKey} phase, all charts below show only this window.
                             </p>
                         )}
                     </section>
@@ -5791,6 +5987,112 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                 </p>
             )}
 
+            </>
+            )}
+
+            {wizardStep === 3 && (
+            <section className="bg-white border border-gray-200 rounded-xl p-6 space-y-5">
+                <div className="space-y-1">
+                    <h2 className="text-lg font-semibold text-gray-900">Anomaly Detection</h2>
+                </div>
+
+                <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-700">
+                    <p className="text-xs uppercase tracking-wide text-gray-500">Current scope</p>
+                    <p className="font-semibold text-gray-800">{detectionScopeLabel}</p>
+                </div>
+
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                    {analysisTitle}
+                </div>
+                {analysisTimestamp && (
+                    <div className="text-xs text-gray-500">
+                        Last analyzed: {formatAnalysisRunLabel(analysisTimestamp, analysisRunMeta)}
+                    </div>
+                )}
+
+                {anomalyError && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                        {anomalyError}
+                    </div>
+                )}
+
+                {(isRunningDetection || anomalyResult || anomalyError) && (
+                    <div className="space-y-3">
+                        {isRunningDetection && !anomalyResult && (
+                            <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+                                <svg
+                                    className="h-4 w-4 animate-spin text-emerald-600"
+                                    fill="none"
+                                    viewBox="0 0 24 24"
+                                >
+                                    <circle
+                                        className="opacity-25"
+                                        cx="12"
+                                        cy="12"
+                                        r="10"
+                                        stroke="currentColor"
+                                        strokeWidth="4"
+                                    />
+                                    <path
+                                        className="opacity-75"
+                                        fill="currentColor"
+                                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                                    />
+                                </svg>
+                                Analysing…
+                            </div>
+                        )}
+
+                    </div>
+                )}
+                <div className="flex justify-end pt-2">
+                    {isRunningDetection ? (
+                        <button
+                            type="button"
+                            disabled
+                            className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-5 py-2 text-sm font-semibold text-gray-400 cursor-not-allowed"
+                        >
+                            <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            Running...
+                        </button>
+                    ) : anomalyResult ? (
+                        <button
+                            type="button"
+                            onClick={handleRunDetection}
+                            disabled={availableParameters.length === 0}
+                            className="inline-flex items-center gap-2 rounded-lg border border-emerald-500 px-5 py-2 text-sm font-semibold text-emerald-600 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            Re-run Analysis
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={handleRunDetection}
+                            disabled={availableParameters.length === 0}
+                            className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
+                        >
+                            Run Analysis
+                        </button>
+                    )}
+                </div>
+                <div className="flex justify-end pt-2">
+                    <button
+                        type="button"
+                        onClick={() => setWizardStep(4)}
+                        disabled={!anomalyResult}
+                        className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
+                    >
+                        Next: Normal Parameters
+                    </button>
+                </div>
+            </section>
+            )}
+
+            {wizardStep === 4 && (
+            <>
             {/* ── Parameter Correlation View (Task 12) ───────────────────────────── */}
             {(() => {
                 // Build grouped selector options — only params present in availableParameters.
@@ -6301,6 +6603,29 @@ export default function FDR({ caseNumber: propCaseNumber }) {
                     </table>
                 </div>
             </section>
+
+            <div className="flex justify-between">
+                <button
+                    type="button"
+                    onClick={() => setWizardStep(3)}
+                    className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-5 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50"
+                >
+                    Back: Data Analysis
+                </button>
+                <button
+                    type="button"
+                    onClick={() => {
+                        setWorkflowStage('results');
+                        setWizardStep(5);
+                    }}
+                    disabled={!anomalyResult}
+                    className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-200"
+                >
+                    Next: Abnormal Parameters
+                </button>
+            </div>
+            </>
+            )}
         </div>
     );
 }

@@ -13,6 +13,7 @@ const {
 
 const { countNotesByCaseId, listNotesByCaseId } = require('./notes');
 const { getFdrAnalysisRunById, getLatestFdrAnalysisRun } = require('./fdr-analysis-runs');
+const { getFdrCorrections } = require('./cases');
 
 const normalizeString = (value) => (typeof value === 'string' ? value.trim() : '');
 
@@ -238,12 +239,13 @@ const buildFdrAnomalyRows = (segments = []) =>
     ];
   });
 
-const buildReportData = ({
+const buildReportData = async ({
   caseData,
   selectedSections,
   fdrRun,
   notes,
   generatedAt,
+  fdrReportData,
 }) => {
   const caseNumber = caseData?.caseNumber || caseData?.case_number || '—';
   const title = caseData?.caseName || 'Investigation Report';
@@ -267,6 +269,17 @@ const buildReportData = ({
     roles: cvrSteps?.roles || null,
     emotion: cvrSteps?.emotion || null,
   };
+
+  let fdrWizardReport = null;
+  if (fdrReportData) {
+    const fdrCorrections = caseData?.caseNumber
+      ? await getFdrCorrections(caseData.caseNumber)
+      : [];
+    fdrWizardReport = {
+      ...fdrReportData,
+      corrections: Array.isArray(fdrCorrections) ? fdrCorrections : [],
+    };
+  }
 
   return {
     caseData,
@@ -299,6 +312,7 @@ const buildReportData = ({
     correlationSummary: normalizeString(caseData?.analyses?.correlate?.summary),
     notes: Array.isArray(notes) ? notes : [],
     attachments,
+    fdrWizardReport,
   };
 };
 
@@ -319,6 +333,7 @@ const generateReportPdf = async (reportData) => {
     notes,
     attachments,
     investigatorSummary,
+    fdrWizardReport,
   } = reportData;
   const resolvedGeneratedAt = generatedAt ?? exportedAt ?? createdAt ?? new Date();
   const resolvedGeneratedLabel =
@@ -458,6 +473,63 @@ const generateReportPdf = async (reportData) => {
     });
   };
 
+  const drawTable = (headers, columnWidths, rows) => {
+    const padding = 6;
+    const maxY = doc.page.height - margins.bottom - 24;
+
+    const measureRowHeight = (row, font, fontSize) => {
+      doc.font(font).fontSize(fontSize);
+      const heights = row.map((cell, index) =>
+        doc.heightOfString(String(cell ?? '—'), {
+          width: columnWidths[index] - padding * 2,
+        }),
+      );
+      return Math.max(...heights, 0) + padding * 2;
+    };
+
+    const drawHeader = () => {
+      const headerHeight = measureRowHeight(headers, 'Helvetica-Bold', 9);
+      if (doc.y + headerHeight > maxY) {
+        doc.addPage();
+      }
+      const startY = doc.y;
+      let x = margins.left;
+      headers.forEach((header, index) => {
+        const width = columnWidths[index];
+        doc.rect(x, startY, width, headerHeight).fillAndStroke('#F3F4F6', '#E5E7EB');
+        doc
+          .fillColor('#111827')
+          .font('Helvetica-Bold')
+          .fontSize(9)
+          .text(header, x + padding, startY + padding, { width: width - padding * 2 });
+        x += width;
+      });
+      doc.y = startY + headerHeight;
+    };
+
+    drawHeader();
+    rows.forEach((row) => {
+      const rowHeight = measureRowHeight(row, 'Helvetica', 9);
+      if (doc.y + rowHeight > maxY) {
+        doc.addPage();
+        drawHeader();
+      }
+      const startY = doc.y;
+      let x = margins.left;
+      row.forEach((cell, index) => {
+        const width = columnWidths[index];
+        doc.rect(x, startY, width, rowHeight).stroke('#E5E7EB');
+        doc
+          .fillColor('#111827')
+          .font('Helvetica')
+          .fontSize(9)
+          .text(cell ?? '—', x + padding, startY + padding, { width: width - padding * 2 });
+        x += width;
+      });
+      doc.y = startY + rowHeight;
+    });
+  };
+
   doc.font('Helvetica-Bold').fontSize(18).fillColor('#111827').text('Investigation Report');
   doc
     .font('Helvetica')
@@ -489,7 +561,92 @@ const generateReportPdf = async (reportData) => {
     doc.font('Helvetica').fontSize(10).fillColor('#111827').text(investigatorSummary);
   }
 
-  if (selectedSections.includes('fdr') && fdrRun) {
+  if (fdrWizardReport) {
+    const { flightSummary, anomalySummary, topFindings, phaseBreakdown, corrections } = fdrWizardReport;
+
+    sectionTitle('FDR Analysis Report');
+
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('Case Details');
+    doc.font('Helvetica').fontSize(10).moveDown(0.2);
+    addKeyValueRow('Investigator', caseSummary.lead);
+    addKeyValueRow('Aircraft type', caseSummary.aircraftType);
+    addKeyValueRow('Occurrence date', caseSummary.occurrenceDate);
+    addKeyValueRow('Location', caseSummary.location);
+
+    doc.moveDown(0.4);
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('Flight Summary');
+    doc.font('Helvetica').fontSize(10).moveDown(0.2);
+    addKeyValueRow('Duration', flightSummary?.durationLabel || '—');
+    addKeyValueRow('Max altitude', flightSummary?.maxAltitudeLabel || '—');
+    addKeyValueRow(
+      'Phases detected',
+      Array.isArray(flightSummary?.phasesDetected) && flightSummary.phasesDetected.length
+        ? flightSummary.phasesDetected.join(', ')
+        : '—',
+    );
+
+    doc.moveDown(0.4);
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('Anomaly Summary');
+    doc.font('Helvetica').fontSize(10).moveDown(0.2);
+    addKeyValueRow('Total findings', anomalySummary?.total ?? 0);
+    addKeyValueRow('High severity', anomalySummary?.high ?? 0);
+    addKeyValueRow('Medium severity', anomalySummary?.med ?? 0);
+    addKeyValueRow('Low severity', anomalySummary?.low ?? 0);
+
+    if (Array.isArray(topFindings) && topFindings.length > 0) {
+      doc.moveDown(0.6);
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('Top 5 Findings');
+      doc.moveDown(0.3);
+      drawTable(
+        ['Parameter', 'Deviation', 'Phase', 'Type'],
+        [140, 130, 110, Math.max(contentWidth - 380, 100)],
+        topFindings.map((f) => [f.parameter, f.deviation, f.phase, f.type]),
+      );
+    }
+
+    if (Array.isArray(phaseBreakdown) && phaseBreakdown.length > 0) {
+      doc.moveDown(0.6);
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('Phase Breakdown');
+      doc.moveDown(0.3);
+      drawTable(
+        ['Phase', 'Rows', 'Segments', 'Worst severity'],
+        [140, 100, 100, Math.max(contentWidth - 340, 100)],
+        phaseBreakdown.map((row) => [
+          row.phase,
+          row.n_rows ?? '—',
+          row.segments_found ?? 0,
+          row.worst_severity ?? '—',
+        ]),
+      );
+    }
+
+    doc.moveDown(0.6);
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('Investigator Corrections Log');
+    doc.moveDown(0.3);
+    if (Array.isArray(corrections) && corrections.length > 0) {
+      doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      corrections.forEach((correction) => {
+        writeFullWidthText(
+          `${String(correction.type || '').replace(/_/g, ' ')} — ${correction.investigator || 'investigator'} (${formatDisplayDateTime(correction.timestamp)})`,
+        );
+      });
+    } else {
+      doc.font('Helvetica').fontSize(10).fillColor('#6B7280').text('No corrections logged.');
+    }
+
+    doc.moveDown(0.8);
+    doc
+      .moveTo(margins.left, doc.y)
+      .lineTo(pageWidth - margins.right, doc.y)
+      .strokeColor('#E5E7EB')
+      .stroke();
+    doc.moveDown(0.4);
+    doc.font('Helvetica').fontSize(9).fillColor('#6B7280').text(`Generated: ${resolvedGeneratedLabel}`);
+    doc.moveDown(1.2);
+    doc.font('Helvetica').fontSize(9).fillColor('#111827').text('Investigator Signature: ______________________');
+  }
+
+  if (selectedSections.includes('fdr') && fdrRun && !fdrWizardReport) {
     const analysisSummary = fdr?.summary || {};
     const segments = Array.isArray(fdr?.segments) ? fdr.segments : [];
 
